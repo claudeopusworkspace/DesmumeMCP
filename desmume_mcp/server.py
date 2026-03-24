@@ -14,7 +14,9 @@ from .emulator import EmulatorState
 
 # Limits
 MAX_ADVANCE_FRAMES = 3600  # 60 seconds at 60fps
-MAX_MEMORY_READ_COUNT = 256
+MAX_MEMORY_READ_COUNT = 4096
+MAX_MEMORY_DUMP_SIZE = 1024 * 1024  # 1 MB
+MAX_DIFF_RESULTS = 500
 MAX_MACRO_STEPS = 100
 MAX_MACRO_REPEAT = 100
 MAX_WATCH_FIELDS = 64
@@ -265,6 +267,174 @@ def _tool_backup_save_export(
     p = Path(path).resolve()
     success = emu.backup_export_file(str(p))
     return {"success": success, "path": str(p)}
+
+
+# ── Memory scanning helpers ───────────────────────────────────────
+
+
+def _read_memory_region(holder: EmulatorState, address: int, size: int) -> bytes:
+    """Read a contiguous region of memory as raw bytes."""
+    emu = holder._require_rom()
+    data = bytearray(size)
+    for i in range(size):
+        data[i] = emu.memory_read_byte(address + i)
+    return bytes(data)
+
+
+def _tool_dump_memory(
+    holder: EmulatorState, address: int, size: int, file_path: str
+) -> dict[str, Any]:
+    if size < 1 or size > MAX_MEMORY_DUMP_SIZE:
+        raise ValueError(f"size must be 1-{MAX_MEMORY_DUMP_SIZE} (1 MB max)")
+    data = _read_memory_region(holder, address, size)
+    p = Path(file_path).resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return {
+        "success": True,
+        "address": f"0x{address:08X}",
+        "size": size,
+        "path": str(p),
+        "frame": holder.frame_count,
+    }
+
+
+def _tool_snapshot_memory(
+    holder: EmulatorState, name: str, address: int, size: int
+) -> dict[str, Any]:
+    if size < 1 or size > MAX_MEMORY_DUMP_SIZE:
+        raise ValueError(f"size must be 1-{MAX_MEMORY_DUMP_SIZE} (1 MB max)")
+    data = _read_memory_region(holder, address, size)
+    # Save binary data
+    bin_path = holder.snapshots_dir / f"{name}.bin"
+    bin_path.write_bytes(data)
+    # Save metadata
+    meta = {
+        "name": name,
+        "address": address,
+        "size": size,
+        "frame": holder.frame_count,
+    }
+    meta_path = holder.snapshots_dir / f"{name}.json"
+    meta_path.write_text(json.dumps(meta, indent=2))
+    return {
+        "success": True,
+        "name": name,
+        "address": f"0x{address:08X}",
+        "size": size,
+        "frame": holder.frame_count,
+    }
+
+
+def _tool_diff_snapshots(
+    holder: EmulatorState,
+    name_a: str,
+    name_b: str,
+    value_size: str,
+    filter_type: str,
+) -> dict[str, Any]:
+    # Load snapshots
+    for name in (name_a, name_b):
+        if not (holder.snapshots_dir / f"{name}.bin").exists():
+            raise FileNotFoundError(f"Snapshot not found: {name!r}")
+
+    meta_a = json.loads((holder.snapshots_dir / f"{name_a}.json").read_text())
+    meta_b = json.loads((holder.snapshots_dir / f"{name_b}.json").read_text())
+
+    if meta_a["address"] != meta_b["address"] or meta_a["size"] != meta_b["size"]:
+        raise ValueError(
+            "Snapshots must cover the same address range. "
+            f"{name_a}: 0x{meta_a['address']:08X}+{meta_a['size']}, "
+            f"{name_b}: 0x{meta_b['address']:08X}+{meta_b['size']}"
+        )
+
+    data_a = (holder.snapshots_dir / f"{name_a}.bin").read_bytes()
+    data_b = (holder.snapshots_dir / f"{name_b}.bin").read_bytes()
+    base_addr = meta_a["address"]
+
+    if value_size not in _WATCH_FIELD_SIZES:
+        raise ValueError(f"value_size must be one of {list(_WATCH_FIELD_SIZES.keys())}")
+    step = _WATCH_FIELD_SIZES[value_size]
+
+    # Parse filter
+    filter_fn = None
+    if filter_type == "changed":
+        filter_fn = lambda old, new: old != new
+    elif filter_type == "increased":
+        filter_fn = lambda old, new: new > old
+    elif filter_type == "decreased":
+        filter_fn = lambda old, new: new < old
+    elif filter_type == "unchanged":
+        filter_fn = lambda old, new: old == new
+    elif filter_type.startswith("delta:"):
+        try:
+            delta = int(filter_type.split(":", 1)[1])
+        except ValueError:
+            raise ValueError(f"Invalid delta filter: {filter_type!r}. Use 'delta:N' (e.g. 'delta:1').")
+        filter_fn = lambda old, new, d=delta: (new - old) == d
+    else:
+        raise ValueError(
+            f"Unknown filter: {filter_type!r}. Valid: changed, increased, decreased, "
+            "unchanged, delta:N (e.g. delta:1, delta:-1)"
+        )
+
+    # Compare
+    signed = value_size != "byte"  # use unsigned for bytes
+    results = []
+    total_compared = 0
+    total_matched = 0
+
+    for offset in range(0, len(data_a) - step + 1, step):
+        if step == 1:
+            val_a = data_a[offset]
+            val_b = data_b[offset]
+        elif step == 2:
+            val_a = int.from_bytes(data_a[offset : offset + 2], "little", signed=False)
+            val_b = int.from_bytes(data_b[offset : offset + 2], "little", signed=False)
+        else:  # 4
+            val_a = int.from_bytes(data_a[offset : offset + 4], "little", signed=False)
+            val_b = int.from_bytes(data_b[offset : offset + 4], "little", signed=False)
+
+        total_compared += 1
+        if filter_fn(val_a, val_b):
+            total_matched += 1
+            if len(results) < MAX_DIFF_RESULTS:
+                results.append({
+                    "address": f"0x{base_addr + offset:08X}",
+                    "offset": offset,
+                    "old": val_a,
+                    "new": val_b,
+                    "delta": val_b - val_a,
+                })
+
+    return {
+        "snapshot_a": name_a,
+        "snapshot_b": name_b,
+        "value_size": value_size,
+        "filter": filter_type,
+        "total_compared": total_compared,
+        "total_matched": total_matched,
+        "results_shown": len(results),
+        "truncated": total_matched > MAX_DIFF_RESULTS,
+        "results": results,
+    }
+
+
+def _tool_list_snapshots(holder: EmulatorState) -> dict[str, Any]:
+    snapshots = []
+    if holder.snapshots_dir.exists():
+        for f in sorted(holder.snapshots_dir.glob("*.json")):
+            try:
+                data = json.loads(f.read_text())
+                snapshots.append({
+                    "name": data["name"],
+                    "address": f"0x{data['address']:08X}",
+                    "size": data["size"],
+                    "frame": data["frame"],
+                })
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return {"snapshots": snapshots}
 
 
 # ── Macro helpers ────────────────────────────────────────────────
@@ -725,6 +895,66 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
             size: Size of the write: "byte" (1), "short" (2), or "long" (4 bytes).
         """
         return _tool_write_memory(holder, address, value, size)
+
+    # ── Memory scanning ──
+
+    @mcp.tool()
+    def dump_memory(address: int, size: int, file_path: str) -> dict[str, Any]:
+        """Dump a region of memory to a binary file on disk.
+
+        Useful for offline analysis of large memory regions. The file contains
+        raw bytes that can be loaded with Python, hex editors, etc.
+
+        Args:
+            address: Starting memory address (e.g. 0x02000000).
+            size: Number of bytes to dump (max 1048576 = 1 MB).
+            file_path: Where to save the binary file.
+        """
+        return _tool_dump_memory(holder, address, size, file_path)
+
+    @mcp.tool()
+    def snapshot_memory(name: str, address: int, size: int) -> dict[str, Any]:
+        """Take a named snapshot of a memory region for later comparison.
+
+        Use with diff_snapshots to find addresses that changed between two game states.
+        Workflow: snapshot state A, perform an action, snapshot state B, diff them.
+
+        Args:
+            name: Unique name for this snapshot (e.g. "before_move", "after_move_right").
+            address: Starting memory address (e.g. 0x02000000 for main RAM).
+            size: Number of bytes to snapshot (max 1048576 = 1 MB).
+        """
+        return _tool_snapshot_memory(holder, name, address, size)
+
+    @mcp.tool()
+    def diff_snapshots(
+        name_a: str,
+        name_b: str,
+        value_size: str = "short",
+        filter: str = "changed",
+    ) -> dict[str, Any]:
+        """Compare two memory snapshots and find addresses that changed.
+
+        Both snapshots must cover the same address range (same address and size).
+        Returns up to 500 matching results with old/new values and deltas.
+
+        Args:
+            name_a: Name of the first (earlier) snapshot.
+            name_b: Name of the second (later) snapshot.
+            value_size: How to interpret memory: "byte" (1), "short" (2), or "long" (4 bytes).
+            filter: What changes to include:
+                - "changed": any value that differs (default)
+                - "increased": value went up
+                - "decreased": value went down
+                - "unchanged": value stayed the same (for narrowing searches)
+                - "delta:N": exact difference (e.g. "delta:1", "delta:-1")
+        """
+        return _tool_diff_snapshots(holder, name_a, name_b, value_size, filter)
+
+    @mcp.tool()
+    def list_snapshots() -> dict[str, Any]:
+        """List all saved memory snapshots."""
+        return _tool_list_snapshots(holder)
 
     # ── Movie recording ──
 
