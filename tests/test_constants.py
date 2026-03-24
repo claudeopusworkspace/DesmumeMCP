@@ -12,19 +12,19 @@ from desmume_mcp.constants import (
 
 
 def test_keymask_values():
-    """Verify bitmask values match ctrlssdl.h KEYMASK_ macro."""
-    assert keymask(Key.A) == 0x0002
-    assert keymask(Key.B) == 0x0004
-    assert keymask(Key.SELECT) == 0x0008
-    assert keymask(Key.START) == 0x0010
-    assert keymask(Key.RIGHT) == 0x0020
-    assert keymask(Key.LEFT) == 0x0040
-    assert keymask(Key.UP) == 0x0080
-    assert keymask(Key.DOWN) == 0x0100
-    assert keymask(Key.R) == 0x0200
-    assert keymask(Key.L) == 0x0400
-    assert keymask(Key.X) == 0x0800
-    assert keymask(Key.Y) == 0x1000
+    """Verify bitmask values match ctrlssdl.cpp update_keypad() bit positions."""
+    assert keymask(Key.A) == 0x0001
+    assert keymask(Key.B) == 0x0002
+    assert keymask(Key.SELECT) == 0x0004
+    assert keymask(Key.START) == 0x0008
+    assert keymask(Key.RIGHT) == 0x0010
+    assert keymask(Key.LEFT) == 0x0020
+    assert keymask(Key.UP) == 0x0040
+    assert keymask(Key.DOWN) == 0x0080
+    assert keymask(Key.R) == 0x0100
+    assert keymask(Key.L) == 0x0200
+    assert keymask(Key.X) == 0x0400
+    assert keymask(Key.Y) == 0x0800
 
 
 def test_keymask_enum_matches():

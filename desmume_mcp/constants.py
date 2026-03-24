@@ -23,24 +23,23 @@ FRAMES_PER_SECOND = 60
 
 
 class Key(IntEnum):
-    """Key indices matching ctrlssdl.h definitions."""
+    """Key indices matching ctrlssdl.cpp update_keypad() bit positions (0-indexed)."""
 
-    NONE = 0
-    A = 1
-    B = 2
-    SELECT = 3
-    START = 4
-    RIGHT = 5
-    LEFT = 6
-    UP = 7
-    DOWN = 8
-    R = 9
-    L = 10
-    X = 11
-    Y = 12
-    DEBUG = 13
-    BOOST = 14
-    LID = 15
+    A = 0
+    B = 1
+    SELECT = 2
+    START = 3
+    RIGHT = 4
+    LEFT = 5
+    UP = 6
+    DOWN = 7
+    R = 8
+    L = 9
+    X = 10
+    Y = 11
+    DEBUG = 12
+    BOOST = 13
+    LID = 14
 
 
 def keymask(key: Key) -> int:
@@ -52,18 +51,18 @@ class KeyMask(IntFlag):
     """Pre-computed key bitmasks for desmume_input_keypad_update."""
 
     NONE = 0
-    A = 1 << Key.A  # 0x0002
-    B = 1 << Key.B  # 0x0004
-    SELECT = 1 << Key.SELECT  # 0x0008
-    START = 1 << Key.START  # 0x0010
-    RIGHT = 1 << Key.RIGHT  # 0x0020
-    LEFT = 1 << Key.LEFT  # 0x0040
-    UP = 1 << Key.UP  # 0x0080
-    DOWN = 1 << Key.DOWN  # 0x0100
-    R = 1 << Key.R  # 0x0200
-    L = 1 << Key.L  # 0x0400
-    X = 1 << Key.X  # 0x0800
-    Y = 1 << Key.Y  # 0x1000
+    A = 1 << Key.A  # 0x0001
+    B = 1 << Key.B  # 0x0002
+    SELECT = 1 << Key.SELECT  # 0x0004
+    START = 1 << Key.START  # 0x0008
+    RIGHT = 1 << Key.RIGHT  # 0x0010
+    LEFT = 1 << Key.LEFT  # 0x0020
+    UP = 1 << Key.UP  # 0x0040
+    DOWN = 1 << Key.DOWN  # 0x0080
+    R = 1 << Key.R  # 0x0100
+    L = 1 << Key.L  # 0x0200
+    X = 1 << Key.X  # 0x0400
+    Y = 1 << Key.Y  # 0x0800
 
 
 # String-to-bitmask lookup for MCP tool convenience
