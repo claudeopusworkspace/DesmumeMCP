@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+*.egg
+
+# Build artifacts
+build/
+desmume-src/desmume/src/frontend/interface/build/
+
+# DeSmuME runtime
+savestates/
+movies/
+*.dsv
+*.dst
+*.dsm
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
