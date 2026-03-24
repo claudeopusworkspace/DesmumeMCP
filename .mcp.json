@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "desmume": {
+      "command": "/workspace/DesmumeMCP/.venv/bin/python",
+      "args": ["-m", "desmume_mcp"],
+      "cwd": "/workspace/DesmumeMCP",
+      "env": {
+        "SDL_VIDEODRIVER": "dummy",
+        "SDL_AUDIODRIVER": "dummy"
+      }
+    }
+  }
+}
