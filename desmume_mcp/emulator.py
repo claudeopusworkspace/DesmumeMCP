@@ -51,6 +51,12 @@ class EmulatorState:
         d.mkdir(exist_ok=True)
         return d
 
+    @property
+    def macros_dir(self) -> Path:
+        d = self.data_dir / "macros"
+        d.mkdir(exist_ok=True)
+        return d
+
     def initialize(self) -> str:
         """Initialize the DeSmuME engine. Must be called first."""
         if self.is_initialized:
@@ -138,6 +144,30 @@ class EmulatorState:
             self.advance_frame(touch_x=x, touch_y=y)
         # Release
         self.advance_frame()
+
+    def run_macro_steps(self, steps: list[dict]) -> int:
+        """Execute a list of macro steps. Returns total frames advanced."""
+        frames_before = self.frame_count
+        for step in steps:
+            action = step["action"]
+            if action == "press":
+                self.press_buttons(step["buttons"], step.get("frames", 1))
+            elif action == "hold":
+                self.advance_frames(
+                    step.get("frames", 1),
+                    step.get("buttons"),
+                    step.get("touch_x"),
+                    step.get("touch_y"),
+                )
+            elif action == "wait":
+                self.advance_frames(step.get("frames", 1))
+            elif action == "tap":
+                self.tap_touch_screen(
+                    step["x"], step["y"], step.get("frames", 1)
+                )
+            else:
+                raise ValueError(f"Unknown macro action: {action!r}")
+        return self.frame_count - frames_before
 
     def capture_screenshot(
         self, screen: str = "both", fmt: str = "png"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,16 @@ from .emulator import EmulatorState
 # Limits
 MAX_ADVANCE_FRAMES = 3600  # 60 seconds at 60fps
 MAX_MEMORY_READ_COUNT = 256
+MAX_MACRO_STEPS = 100
+MAX_MACRO_REPEAT = 100
+
+# Valid macro step actions and their required/optional fields
+_MACRO_STEP_SCHEMA: dict[str, dict[str, Any]] = {
+    "press": {"required": ["buttons"], "optional": ["frames"]},
+    "hold": {"required": [], "optional": ["buttons", "frames", "touch_x", "touch_y"]},
+    "wait": {"required": [], "optional": ["frames"]},
+    "tap": {"required": ["x", "y"], "optional": ["frames"]},
+}
 
 
 # ── Tool logic functions (testable without MCP protocol) ──────────
@@ -249,6 +260,112 @@ def _tool_backup_save_export(
     return {"success": success, "path": str(p)}
 
 
+# ── Macro helpers ────────────────────────────────────────────────
+
+
+def _validate_macro_steps(steps: list[dict]) -> None:
+    """Validate macro steps against the schema."""
+    if not steps:
+        raise ValueError("Macro must have at least one step.")
+    if len(steps) > MAX_MACRO_STEPS:
+        raise ValueError(f"Macro can have at most {MAX_MACRO_STEPS} steps.")
+
+    for i, step in enumerate(steps):
+        if "action" not in step:
+            raise ValueError(f"Step {i}: missing 'action' field.")
+        action = step["action"]
+        if action not in _MACRO_STEP_SCHEMA:
+            raise ValueError(
+                f"Step {i}: unknown action {action!r}. "
+                f"Valid: {list(_MACRO_STEP_SCHEMA.keys())}"
+            )
+        schema = _MACRO_STEP_SCHEMA[action]
+        for field in schema["required"]:
+            if field not in step:
+                raise ValueError(
+                    f"Step {i} ({action}): missing required field {field!r}."
+                )
+        valid_fields = {"action"} | set(schema["required"]) | set(schema["optional"])
+        for field in step:
+            if field not in valid_fields:
+                raise ValueError(
+                    f"Step {i} ({action}): unknown field {field!r}. "
+                    f"Valid: {sorted(valid_fields)}"
+                )
+        if "frames" in step:
+            f = step["frames"]
+            if not isinstance(f, int) or f < 1 or f > MAX_ADVANCE_FRAMES:
+                raise ValueError(f"Step {i}: frames must be 1-{MAX_ADVANCE_FRAMES}.")
+
+
+def _tool_create_macro(
+    holder: EmulatorState,
+    name: str,
+    description: str,
+    steps: list[dict],
+) -> dict[str, Any]:
+    _validate_macro_steps(steps)
+    macro = {"name": name, "description": description, "steps": steps}
+    path = holder.macros_dir / f"{name}.json"
+    path.write_text(json.dumps(macro, indent=2))
+    return {
+        "success": True,
+        "name": name,
+        "description": description,
+        "step_count": len(steps),
+        "path": str(path),
+    }
+
+
+def _tool_list_macros(holder: EmulatorState) -> dict[str, Any]:
+    macros = []
+    if holder.macros_dir.exists():
+        for f in sorted(holder.macros_dir.glob("*.json")):
+            try:
+                data = json.loads(f.read_text())
+                macros.append({
+                    "name": data["name"],
+                    "description": data["description"],
+                    "step_count": len(data["steps"]),
+                })
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return {"macros": macros}
+
+
+def _tool_run_macro(
+    holder: EmulatorState, name: str, repeat: int
+) -> dict[str, Any]:
+    holder._require_rom()
+    if repeat < 1 or repeat > MAX_MACRO_REPEAT:
+        raise ValueError(f"repeat must be 1-{MAX_MACRO_REPEAT}")
+    path = holder.macros_dir / f"{name}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Macro not found: {name!r}")
+    data = json.loads(path.read_text())
+    steps = data["steps"]
+    _validate_macro_steps(steps)
+
+    total_frames = 0
+    for _ in range(repeat):
+        total_frames += holder.run_macro_steps(steps)
+
+    return {
+        "name": name,
+        "repeat": repeat,
+        "frames_advanced": total_frames,
+        "total_frame": holder.frame_count,
+    }
+
+
+def _tool_delete_macro(holder: EmulatorState, name: str) -> dict[str, Any]:
+    path = holder.macros_dir / f"{name}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Macro not found: {name!r}")
+    path.unlink()
+    return {"success": True, "name": name}
+
+
 # ── Server factory ───────────────────────────────────────────────
 
 
@@ -429,6 +546,76 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
     def stop_recording() -> dict[str, Any]:
         """Stop the current movie recording or playback."""
         return _tool_stop_recording(holder)
+
+    # ── Macros ──
+
+    @mcp.tool()
+    def create_macro(
+        name: str,
+        description: str,
+        steps: list[dict],
+    ) -> dict[str, Any]:
+        """Create a reusable input macro. Macros are saved to disk and persist across sessions.
+
+        Each step is a dict with an "action" and its parameters. Available actions:
+
+        - {"action": "press", "buttons": ["a"], "frames": 1}
+          Press and release buttons (hold for N frames, then release for 1 frame).
+
+        - {"action": "hold", "buttons": ["right"], "frames": 60}
+          Hold buttons for N frames WITHOUT releasing. Can also include touch_x/touch_y.
+
+        - {"action": "wait", "frames": 30}
+          Advance N frames with no input (all buttons released).
+
+        - {"action": "tap", "x": 128, "y": 96, "frames": 1}
+          Tap the touchscreen for N frames, then release for 1 frame.
+
+        Example — mash A through dialogue (press A, wait, repeat 5 times):
+          steps=[
+            {"action": "press", "buttons": ["a"]},
+            {"action": "wait", "frames": 15},
+            {"action": "press", "buttons": ["a"]},
+            {"action": "wait", "frames": 15},
+            {"action": "press", "buttons": ["a"]},
+            {"action": "wait", "frames": 15},
+            {"action": "press", "buttons": ["a"]},
+            {"action": "wait", "frames": 15},
+            {"action": "press", "buttons": ["a"]},
+            {"action": "wait", "frames": 15},
+          ]
+
+        Args:
+            name: Unique name for the macro (used as filename, e.g. "mash_a", "walk_right").
+            description: Short description of what the macro does.
+            steps: List of step dicts. Max 100 steps per macro.
+        """
+        return _tool_create_macro(holder, name, description, steps)
+
+    @mcp.tool()
+    def list_macros() -> dict[str, Any]:
+        """List all saved macros with their names, descriptions, and step counts."""
+        return _tool_list_macros(holder)
+
+    @mcp.tool()
+    def run_macro(name: str, repeat: int = 1) -> dict[str, Any]:
+        """Execute a saved macro. Optionally repeat it multiple times.
+
+        Args:
+            name: Name of the macro to run.
+            repeat: Number of times to run the macro (1-100). Useful for repeated
+                    actions like mashing A through long dialogue.
+        """
+        return _tool_run_macro(holder, name, repeat)
+
+    @mcp.tool()
+    def delete_macro(name: str) -> dict[str, Any]:
+        """Delete a saved macro.
+
+        Args:
+            name: Name of the macro to delete.
+        """
+        return _tool_delete_macro(holder, name)
 
     # ── Battery save (backup) ──
 
