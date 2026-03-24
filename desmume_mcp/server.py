@@ -84,6 +84,24 @@ def _tool_get_screenshot(
     return holder.capture_screenshot(screen, fmt="png")
 
 
+def _tool_save_screenshot(
+    holder: EmulatorState, file_path: str, screen: str
+) -> dict[str, Any]:
+    if screen not in ("top", "bottom", "both"):
+        raise ValueError("screen must be 'top', 'bottom', or 'both'")
+    mime, image_bytes = holder.capture_screenshot(screen, fmt="png")
+    p = Path(file_path).resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(image_bytes)
+    return {
+        "success": True,
+        "path": str(p),
+        "size_bytes": len(image_bytes),
+        "screen": screen,
+        "frame": holder.frame_count,
+    }
+
+
 def _tool_get_status(holder: EmulatorState) -> dict[str, Any]:
     status: dict[str, Any] = {
         "initialized": holder.is_initialized,
@@ -312,6 +330,16 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
             data=base64.b64encode(image_bytes).decode("ascii"),
             mimeType=mime,
         )
+
+    @mcp.tool()
+    def save_screenshot(file_path: str, screen: str = "both") -> dict[str, Any]:
+        """Save the current display as a PNG file on disk. Useful for visual documentation.
+
+        Args:
+            file_path: Where to save the PNG (e.g. "/workspace/screenshots/frame_100.png").
+            screen: Which screen to capture: "top", "bottom", or "both" (stacked vertically).
+        """
+        return _tool_save_screenshot(holder, file_path, screen)
 
     @mcp.tool()
     def get_status() -> dict[str, Any]:
