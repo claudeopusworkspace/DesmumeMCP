@@ -57,6 +57,12 @@ class EmulatorState:
         d.mkdir(exist_ok=True)
         return d
 
+    @property
+    def watches_dir(self) -> Path:
+        d = self.data_dir / "watches"
+        d.mkdir(exist_ok=True)
+        return d
+
     def initialize(self) -> str:
         """Initialize the DeSmuME engine. Must be called first."""
         if self.is_initialized:

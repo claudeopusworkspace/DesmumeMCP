@@ -17,6 +17,7 @@ MAX_ADVANCE_FRAMES = 3600  # 60 seconds at 60fps
 MAX_MEMORY_READ_COUNT = 256
 MAX_MACRO_STEPS = 100
 MAX_MACRO_REPEAT = 100
+MAX_WATCH_FIELDS = 64
 
 # Valid macro step actions and their required/optional fields
 _MACRO_STEP_SCHEMA: dict[str, dict[str, Any]] = {
@@ -25,6 +26,12 @@ _MACRO_STEP_SCHEMA: dict[str, dict[str, Any]] = {
     "wait": {"required": [], "optional": ["frames"]},
     "tap": {"required": ["x", "y"], "optional": ["frames"]},
 }
+
+# Valid watch field sizes and their byte widths
+_WATCH_FIELD_SIZES = {"byte": 1, "short": 2, "long": 4}
+
+# Valid transform types
+_WATCH_TRANSFORM_TYPES = {"map"}
 
 
 # ── Tool logic functions (testable without MCP protocol) ──────────
@@ -366,6 +373,197 @@ def _tool_delete_macro(holder: EmulatorState, name: str) -> dict[str, Any]:
     return {"success": True, "name": name}
 
 
+# ── Watch helpers ────────────────────────────────────────────────
+
+
+def _validate_watch_fields(fields: list[dict]) -> None:
+    """Validate memory watch field definitions."""
+    if not fields:
+        raise ValueError("Watch must have at least one field.")
+    if len(fields) > MAX_WATCH_FIELDS:
+        raise ValueError(f"Watch can have at most {MAX_WATCH_FIELDS} fields.")
+
+    names_seen: set[str] = set()
+    for i, field in enumerate(fields):
+        # Required keys
+        for key in ("name", "offset", "size"):
+            if key not in field:
+                raise ValueError(f"Field {i}: missing required key {key!r}.")
+
+        name = field["name"]
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"Field {i}: 'name' must be a non-empty string.")
+        if name in names_seen:
+            raise ValueError(f"Field {i}: duplicate field name {name!r}.")
+        names_seen.add(name)
+
+        if not isinstance(field["offset"], int) or field["offset"] < 0:
+            raise ValueError(f"Field {i} ({name}): 'offset' must be a non-negative integer.")
+
+        if field["size"] not in _WATCH_FIELD_SIZES:
+            raise ValueError(
+                f"Field {i} ({name}): 'size' must be one of {list(_WATCH_FIELD_SIZES.keys())}."
+            )
+
+        # Optional keys
+        if "signed" in field and not isinstance(field["signed"], bool):
+            raise ValueError(f"Field {i} ({name}): 'signed' must be a boolean.")
+
+        if "transform" in field:
+            _validate_transform(i, name, field["transform"])
+
+        valid_keys = {"name", "offset", "size", "signed", "transform"}
+        for key in field:
+            if key not in valid_keys:
+                raise ValueError(
+                    f"Field {i} ({name}): unknown key {key!r}. Valid: {sorted(valid_keys)}"
+                )
+
+
+def _validate_transform(field_idx: int, field_name: str, transform: dict) -> None:
+    """Validate a single field transform."""
+    if "type" not in transform:
+        raise ValueError(f"Field {field_idx} ({field_name}): transform missing 'type'.")
+    if transform["type"] not in _WATCH_TRANSFORM_TYPES:
+        raise ValueError(
+            f"Field {field_idx} ({field_name}): unknown transform type {transform['type']!r}. "
+            f"Valid: {sorted(_WATCH_TRANSFORM_TYPES)}"
+        )
+
+    if transform["type"] == "map":
+        if "values" not in transform:
+            raise ValueError(
+                f"Field {field_idx} ({field_name}): map transform requires 'values' dict."
+            )
+        if not isinstance(transform["values"], dict):
+            raise ValueError(
+                f"Field {field_idx} ({field_name}): 'values' must be a dict mapping "
+                "string keys (raw values) to display strings."
+            )
+        valid_keys = {"type", "values", "default"}
+        for key in transform:
+            if key not in valid_keys:
+                raise ValueError(
+                    f"Field {field_idx} ({field_name}): unknown transform key {key!r}."
+                )
+
+
+def _apply_transform(transform: dict, raw_value: int) -> str | None:
+    """Apply a transform to a raw value. Returns display string or None."""
+    if transform["type"] == "map":
+        values = transform["values"]
+        # Look up by string key (JSON keys are always strings)
+        result = values.get(str(raw_value))
+        if result is not None:
+            return result
+        return transform.get("default")
+    return None
+
+
+def _execute_watch_fields(
+    holder: EmulatorState, base_address: int, fields: list[dict]
+) -> list[dict[str, Any]]:
+    """Read memory for each field and apply transforms."""
+    emu = holder._require_rom()
+    results = []
+    for field in fields:
+        address = base_address + field["offset"]
+        size = field["size"]
+        signed = field.get("signed", False)
+
+        # Read the raw value
+        if size == "byte":
+            raw = emu.memory_read_byte_signed(address) if signed else emu.memory_read_byte(address)
+        elif size == "short":
+            raw = emu.memory_read_short_signed(address) if signed else emu.memory_read_short(address)
+        else:  # long
+            raw = emu.memory_read_long_signed(address) if signed else emu.memory_read_long(address)
+
+        entry: dict[str, Any] = {
+            "name": field["name"],
+            "value": raw,
+        }
+
+        # Apply transform if present
+        if "transform" in field:
+            display = _apply_transform(field["transform"], raw)
+            if display is not None:
+                entry["display"] = display
+
+        results.append(entry)
+    return results
+
+
+def _tool_create_watch(
+    holder: EmulatorState,
+    name: str,
+    description: str,
+    base_address: int,
+    fields: list[dict],
+) -> dict[str, Any]:
+    _validate_watch_fields(fields)
+    watch = {
+        "name": name,
+        "description": description,
+        "base_address": base_address,
+        "fields": fields,
+    }
+    path = holder.watches_dir / f"{name}.json"
+    path.write_text(json.dumps(watch, indent=2))
+    return {
+        "success": True,
+        "name": name,
+        "description": description,
+        "base_address": f"0x{base_address:08X}",
+        "field_count": len(fields),
+        "path": str(path),
+    }
+
+
+def _tool_list_watches(holder: EmulatorState) -> dict[str, Any]:
+    watches = []
+    if holder.watches_dir.exists():
+        for f in sorted(holder.watches_dir.glob("*.json")):
+            try:
+                data = json.loads(f.read_text())
+                watches.append({
+                    "name": data["name"],
+                    "description": data["description"],
+                    "base_address": f"0x{data['base_address']:08X}",
+                    "field_count": len(data["fields"]),
+                    "fields": [fd["name"] for fd in data["fields"]],
+                })
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return {"watches": watches}
+
+
+def _tool_read_watch(holder: EmulatorState, name: str) -> dict[str, Any]:
+    holder._require_rom()
+    path = holder.watches_dir / f"{name}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Watch not found: {name!r}")
+    data = json.loads(path.read_text())
+    _validate_watch_fields(data["fields"])
+
+    results = _execute_watch_fields(holder, data["base_address"], data["fields"])
+    return {
+        "name": name,
+        "description": data["description"],
+        "base_address": f"0x{data['base_address']:08X}",
+        "frame": holder.frame_count,
+        "fields": results,
+    }
+
+
+def _tool_delete_watch(holder: EmulatorState, name: str) -> dict[str, Any]:
+    path = holder.watches_dir / f"{name}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Watch not found: {name!r}")
+    path.unlink()
+    return {"success": True, "name": name}
+
+
 # ── Server factory ───────────────────────────────────────────────
 
 
@@ -616,6 +814,75 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
             name: Name of the macro to delete.
         """
         return _tool_delete_macro(holder, name)
+
+    # ── Memory watches ──
+
+    @mcp.tool()
+    def create_watch(
+        name: str,
+        description: str,
+        base_address: int,
+        fields: list[dict],
+    ) -> dict[str, Any]:
+        """Create a reusable memory watch. Watches are saved to disk and persist across sessions.
+
+        A watch reads structured data from a known memory address. Useful for monitoring
+        game state (party Pokemon, inventory, player position, etc.) without screenshots.
+
+        Each field reads a value at base_address + offset. Fields can optionally include
+        a transform to convert raw values to meaningful display strings.
+
+        Field format:
+            {
+                "name": "species_id",     # Label for this value
+                "offset": 0,              # Byte offset from base_address
+                "size": "short",          # "byte" (1), "short" (2), or "long" (4 bytes)
+                "signed": false,          # Optional, default false
+                "transform": {            # Optional
+                    "type": "map",
+                    "values": {"393": "Piplup", "390": "Chimchar"},
+                    "default": "Unknown"
+                }
+            }
+
+        Transform types:
+            - "map": Dictionary lookup. Keys are stringified raw values, values are display strings.
+                     "default" is returned when no key matches (omit to return no display value).
+
+        Args:
+            name: Unique name for the watch (e.g. "party_slot_1", "player_position").
+            description: Short description of what this watch monitors.
+            base_address: Starting memory address (e.g. 0x02000000).
+            fields: List of field definitions (max 64).
+        """
+        return _tool_create_watch(holder, name, description, base_address, fields)
+
+    @mcp.tool()
+    def list_watches() -> dict[str, Any]:
+        """List all saved memory watches with their names, descriptions, and field names."""
+        return _tool_list_watches(holder)
+
+    @mcp.tool()
+    def read_watch(name: str) -> dict[str, Any]:
+        """Execute a saved memory watch and return the current values.
+
+        Returns each field's raw value and, if a transform is defined, a display value.
+        For example, a species_id field with a map transform might return:
+            {"name": "species_id", "value": 393, "display": "Piplup"}
+
+        Args:
+            name: Name of the watch to read.
+        """
+        return _tool_read_watch(holder, name)
+
+    @mcp.tool()
+    def delete_watch(name: str) -> dict[str, Any]:
+        """Delete a saved memory watch.
+
+        Args:
+            name: Name of the watch to delete.
+        """
+        return _tool_delete_watch(holder, name)
 
     # ── Battery save (backup) ──
 
