@@ -36,57 +36,37 @@ python -m desmume_mcp
 - Headless mode requires `SDL_VIDEODRIVER=dummy` and `SDL_AUDIODRIVER=dummy` env vars.
 - Memory reads (`read_memory`, `dump_memory`, etc.) work across the full ARM9 address space — not just main RAM. VRAM (0x06000000), I/O registers (0x04000000), and cartridge-mapped regions are all accessible.
 
-## Custom Scripts (Beyond MCP Tools)
+## Custom Scripts (Bridge Client)
 
-For complex logic that goes beyond what MCP tools can express (e.g., "walk a path and verify each step succeeded"), you can write standalone Python scripts that use the emulator modules directly.
+For complex logic that goes beyond what MCP tools can express (e.g., "walk a path and verify each step succeeded"), write standalone Python scripts that connect to the running emulator via the IPC bridge.
 
-**The pattern: savestate handoff.**
+When `init_emulator` is called, the MCP server starts a Unix domain socket bridge at `<data_dir>/.desmume_bridge.sock`. External scripts connect to it and control the **same emulator instance** the MCP is using — no savestate handoff, no separate emulator, zero overhead.
 
-The MCP server owns the running emulator instance — a standalone script can't share it. Instead:
-
-1. Save state in MCP: `save_state("before_script")`
-2. Run your script (it creates its own emulator, loads that savestate, does the work, saves a new state)
-3. Load the result in MCP: `load_state("after_script")`
-
-**Example script** — walk a path with position verification:
+**Example** — walk a path with position verification:
 
 ```python
 #!/usr/bin/env python3
 """Walk a path, verifying each step moved the player."""
-import os, sys, struct
-
-os.environ["SDL_VIDEODRIVER"] = "dummy"
-os.environ["SDL_AUDIODRIVER"] = "dummy"
-
-# Add the DesmumeMCP package to the path
+import sys
 sys.path.insert(0, "/path/to/DesmumeMCP")
 
-from desmume_mcp.emulator import EmulatorState
-from desmume_mcp.constants import buttons_to_bitmask
+from desmume_mcp.client import connect
 
-POSITION_ADDR = 0x02345678  # Example — use actual address from your watch
+emu = connect()  # Auto-discovers the bridge socket
 
-emu = EmulatorState()
-emu.initialize()
-emu.load_rom("/path/to/game.nds")
-
-# Load the savestate from MCP
-emu.emu.savestate_load("/path/to/savestates/before_script.dst")
-emu.is_rom_loaded = True
+POSITION_ADDR = 0x02345678  # Use actual address from your memory watch
 
 def read_position():
-    x = emu.emu.memory_read_long(POSITION_ADDR) & 0xFFFFFFFF
-    y = emu.emu.memory_read_long(POSITION_ADDR + 4) & 0xFFFFFFFF
+    x = emu.read_memory(POSITION_ADDR, size="long")
+    y = emu.read_memory(POSITION_ADDR + 4, size="long")
     return (x, y)
 
 path = ["right", "right", "up", "up", "up", "left"]
 
 for i, direction in enumerate(path):
     old_pos = read_position()
-    emu.advance_frame(buttons=[direction])
-    # Hold for 16 frames (one tile)
-    emu.advance_frames(15, buttons=[direction])
-    # Wait for movement to complete
+    # Hold direction for 16 frames (one tile), then wait 8 for step to complete
+    emu.advance_frames(16, buttons=[direction])
     emu.advance_frames(8)
     new_pos = read_position()
     if old_pos == new_pos:
@@ -94,17 +74,27 @@ for i, direction in enumerate(path):
         break
     print(f"Step {i} ({direction}): {old_pos} -> {new_pos}")
 
-# Save the result for MCP to pick up
-emu.emu.savestate_save("/path/to/savestates/after_script.dst")
 print(f"Final position: {read_position()}")
 ```
 
-Run via Bash, then `load_state("after_script")` in MCP to continue.
+Run via Bash while the MCP server is active — the script operates on the same emulator frame state.
 
-**Available modules:**
+**Bridge client API:**
 
-| Module | What it provides |
-|--------|-----------------|
-| `desmume_mcp.libdesmume.DeSmuME` | Low-level ctypes wrapper — direct 1:1 C function calls |
-| `desmume_mcp.emulator.EmulatorState` | Higher-level holder — `advance_frame()`, `press_buttons()`, `capture_screenshot()` |
-| `desmume_mcp.constants` | `Key`, `KeyMask`, `BUTTON_MAP`, `buttons_to_bitmask()`, screen dimensions |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `advance_frames(count, buttons, touch_x, touch_y)` | dict | Advance N frames with input |
+| `advance_frame(buttons, touch_x, touch_y)` | dict | Advance 1 frame |
+| `press_buttons(buttons, frames)` | dict | Press+release pattern |
+| `tap_touch_screen(x, y, frames)` | dict | Touch+release |
+| `read_memory(address, size, signed)` | int | Read single value |
+| `read_memory_range(address, size, count, signed)` | list[int] | Read consecutive values |
+| `write_memory(address, value, size)` | None | Write value |
+| `cycle()` | int | Raw frame advance (no input change) |
+| `save_state(path)` / `load_state(path)` | bool | Savestate management |
+| `get_screenshot(screen, fmt)` | (mime, bytes) | Screenshot capture |
+| `get_frame_count()` | int | Current frame number |
+
+**Fallback: savestate handoff** (if the bridge isn't available):
+
+Scripts can also create their own emulator instance using `desmume_mcp.emulator.EmulatorState` directly, coordinating with the MCP via savestates. See `libdesmume.py` and `emulator.py` for the module API.

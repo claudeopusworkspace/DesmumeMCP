@@ -39,9 +39,26 @@ _WATCH_TRANSFORM_TYPES = {"map"}
 # ── Tool logic functions (testable without MCP protocol) ──────────
 
 
+def _start_bridge(holder: EmulatorState) -> str | None:
+    """Start the IPC bridge server if not already running."""
+    if hasattr(holder, "_bridge") and holder._bridge is not None:
+        return holder._bridge._socket_path
+    from .bridge import BridgeServer
+
+    sock_path = str(holder.data_dir / ".desmume_bridge.sock")
+    bridge = BridgeServer(holder, sock_path)
+    path = bridge.start()
+    holder._bridge = bridge
+    return path
+
+
 def _tool_init_emulator(holder: EmulatorState) -> dict[str, Any]:
     msg = holder.initialize()
-    return {"success": True, "message": msg}
+    bridge_path = _start_bridge(holder)
+    result: dict[str, Any] = {"success": True, "message": msg}
+    if bridge_path:
+        result["bridge_socket"] = bridge_path
+    return result
 
 
 def _tool_load_rom(holder: EmulatorState, rom_path: str) -> dict[str, Any]:
