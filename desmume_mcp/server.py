@@ -543,6 +543,119 @@ def _tool_delete_macro(holder: EmulatorState, name: str) -> dict[str, Any]:
     return {"success": True, "name": name}
 
 
+# ── ROM filesystem helpers ────────────────────────────────────────
+
+
+def _get_rom_object(holder: EmulatorState):
+    """Load and cache the parsed NDS ROM object."""
+    holder._require_rom()
+    if not hasattr(holder, "_rom_obj") or holder._rom_obj is None:
+        import ndspy.rom
+
+        holder._rom_obj = ndspy.rom.NintendoDSRom.fromFile(holder.rom_path)
+    return holder._rom_obj
+
+
+def _walk_rom_folder(folder, prefix: str = "") -> list[dict[str, Any]]:
+    """Recursively enumerate files in an ndspy Folder."""
+    entries: list[dict[str, Any]] = []
+    for name, subfolder in folder.folders:
+        entries.append({"path": prefix + name + "/", "type": "directory"})
+        entries.extend(_walk_rom_folder(subfolder, prefix + name + "/"))
+    for fname in folder.files:
+        entries.append({"path": prefix + fname, "type": "file"})
+    return entries
+
+
+def _tool_list_rom_files(
+    holder: EmulatorState, path: str
+) -> dict[str, Any]:
+    rom = _get_rom_object(holder)
+    root = rom.filenames
+
+    # Navigate to the requested path
+    if path and path != "/":
+        parts = [p for p in path.strip("/").split("/") if p]
+        current = root
+        for part in parts:
+            found = False
+            for name, subfolder in current.folders:
+                if name == part:
+                    current = subfolder
+                    found = True
+                    break
+            if not found:
+                raise FileNotFoundError(f"ROM path not found: {path!r}")
+        entries: list[dict[str, Any]] = []
+        for name, subfolder in current.folders:
+            entries.append({"path": path.rstrip("/") + "/" + name + "/", "type": "directory"})
+        for fname in current.files:
+            fid = rom.filenames.idOf(path.strip("/") + "/" + fname)
+            entries.append({
+                "path": path.rstrip("/") + "/" + fname,
+                "type": "file",
+                "size": len(rom.files[fid]),
+            })
+    else:
+        entries = []
+        for name, subfolder in root.folders:
+            entries.append({"path": name + "/", "type": "directory"})
+        for fname in root.files:
+            entries.append({"path": fname, "type": "file"})
+
+    return {"path": path, "entries": entries}
+
+
+def _tool_extract_rom_file(
+    holder: EmulatorState, rom_path: str, output_path: str
+) -> dict[str, Any]:
+    rom = _get_rom_object(holder)
+    clean_path = rom_path.strip("/")
+    try:
+        fid = rom.filenames.idOf(clean_path)
+    except ValueError:
+        raise FileNotFoundError(f"File not found in ROM: {rom_path!r}")
+    data = rom.files[fid]
+    p = Path(output_path).resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return {
+        "success": True,
+        "rom_path": rom_path,
+        "output_path": str(p),
+        "size": len(data),
+    }
+
+
+def _tool_unpack_narc(
+    holder: EmulatorState, file_path: str, output_dir: str
+) -> dict[str, Any]:
+    import ndspy.narc
+
+    p = Path(file_path).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+    narc = ndspy.narc.NARC(p.read_bytes())
+
+    out = Path(output_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    extracted = []
+    for i, data in enumerate(narc.files):
+        fname = f"{i:04d}.bin"
+        (out / fname).write_bytes(data)
+        extracted.append({"index": i, "name": fname, "size": len(data)})
+
+    return {
+        "success": True,
+        "source": str(p),
+        "output_dir": str(out),
+        "file_count": len(extracted),
+        "files": extracted[:50],  # Cap listing at 50
+        "truncated": len(extracted) > 50,
+    }
+
+
 # ── Watch helpers ────────────────────────────────────────────────
 
 
@@ -955,6 +1068,43 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
     def list_snapshots() -> dict[str, Any]:
         """List all saved memory snapshots."""
         return _tool_list_snapshots(holder)
+
+    # ── ROM filesystem ──
+
+    @mcp.tool()
+    def list_rom_files(path: str = "/") -> dict[str, Any]:
+        """List files and directories inside the loaded ROM's NitroFS filesystem.
+
+        Every NDS ROM contains an internal filesystem. This tool lets you browse it
+        to find map data, sprites, scripts, and other game assets.
+
+        Args:
+            path: Directory path within the ROM (e.g. "/", "/fielddata/", "/fielddata/land_data/").
+        """
+        return _tool_list_rom_files(holder, path)
+
+    @mcp.tool()
+    def extract_rom_file(rom_path: str, output_path: str) -> dict[str, Any]:
+        """Extract a file from the loaded ROM's internal filesystem to disk.
+
+        Args:
+            rom_path: Path within the ROM (e.g. "fielddata/land_data/land_data.narc").
+            output_path: Where to save the extracted file on disk.
+        """
+        return _tool_extract_rom_file(holder, rom_path, output_path)
+
+    @mcp.tool()
+    def unpack_narc(file_path: str, output_dir: str) -> dict[str, Any]:
+        """Unpack a NARC archive file (standard Nintendo DS archive format).
+
+        NARC files contain numbered sub-files. Common in DS games for map data,
+        model data, textures, etc. Files are extracted as 0000.bin, 0001.bin, etc.
+
+        Args:
+            file_path: Path to the .narc file on disk (extract it first with extract_rom_file).
+            output_dir: Directory to extract files into.
+        """
+        return _tool_unpack_narc(holder, file_path, output_dir)
 
     # ── Movie recording ──
 

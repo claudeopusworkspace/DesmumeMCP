@@ -14,6 +14,7 @@ iniconfig==2.3.0
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 mcp==1.26.0
+ndspy==4.2.0
 packaging==26.0
 pillow==12.1.1
 pluggy==1.6.0
