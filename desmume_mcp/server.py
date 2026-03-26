@@ -959,7 +959,7 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         return _tool_press_buttons(holder, buttons, frames)
 
     @mcp.tool()
-    def tap_touch_screen(x: int, y: int, frames: int = 1) -> dict[str, Any]:
+    def tap_touch_screen(x: int, y: int, frames: int = 8) -> dict[str, Any]:
         """Tap the touchscreen (bottom screen) at a position. Holds for N frames then releases.
 
         The bottom screen is 256x192 pixels. Coordinates are relative to the bottom screen.
@@ -967,7 +967,7 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         Args:
             x: X position (0-255).
             y: Y position (0-191).
-            frames: How many frames to hold the tap (1-3600).
+            frames: How many frames to hold the tap (1-3600). Default 8 for reliable input.
         """
         return _tool_tap_touch_screen(holder, x, y, frames)
 
