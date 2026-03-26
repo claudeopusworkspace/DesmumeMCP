@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +39,7 @@ class EmulatorState:
     is_rom_loaded: bool = False
     frame_count: int = 0
     data_dir: Path = field(default_factory=lambda: Path.cwd())
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def savestates_dir(self) -> Path:

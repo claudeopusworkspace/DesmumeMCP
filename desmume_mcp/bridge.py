@@ -34,7 +34,6 @@ class BridgeServer:
 
         self._holder: EmulatorState = holder
         self._socket_path = socket_path
-        self._lock = threading.Lock()
         self._server_sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -238,7 +237,7 @@ class BridgeServer:
 
         params = req.get("params", {})
 
-        with self._lock:
+        with self._holder.lock:
             try:
                 result = self._methods[method](**params)
                 return json.dumps({"result": result})

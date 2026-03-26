@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,17 @@ from mcp.server.fastmcp import FastMCP
 
 from .constants import FRAMES_PER_SECOND, VALID_BUTTONS
 from .emulator import EmulatorState
+
+
+def _with_lock(holder: EmulatorState):
+    """Decorator factory — wraps a tool function so it acquires the emulator lock."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with holder.lock:
+                return fn(*args, **kwargs)
+        return wrapper
+    return decorator
 
 # Limits
 MAX_ADVANCE_FRAMES = 3600  # 60 seconds at 60fps
@@ -1300,5 +1312,12 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
             path: Destination path for the save file.
         """
         return _tool_backup_save_export(holder, path)
+
+    # Wrap all registered tools with the emulator lock so MCP tool calls
+    # and bridge calls (from the background thread) never hit the emulator
+    # concurrently. DeSmuME is not thread-safe.
+    lock_wrap = _with_lock(holder)
+    for name, tool in mcp._tool_manager._tools.items():
+        tool.fn = lock_wrap(tool.fn)
 
     return mcp
