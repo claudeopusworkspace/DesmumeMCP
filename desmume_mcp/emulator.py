@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from PIL import Image
 
@@ -40,6 +42,19 @@ class EmulatorState:
     frame_count: int = 0
     data_dir: Path = field(default_factory=lambda: Path.cwd())
     lock: threading.Lock = field(default_factory=threading.Lock)
+    _frame_callbacks: list[Callable[[], None]] = field(default_factory=list)
+
+    def on_frame_change(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked after any operation that changes frames."""
+        self._frame_callbacks.append(callback)
+
+    def _notify_frame_change(self) -> None:
+        """Fire all registered frame-change callbacks."""
+        for cb in self._frame_callbacks:
+            try:
+                cb()
+            except Exception:
+                logging.getLogger(__name__).debug("frame callback error", exc_info=True)
 
     @property
     def savestates_dir(self) -> Path:
@@ -102,6 +117,7 @@ class EmulatorState:
         self.is_rom_loaded = True
         self.frame_count = 0
         self.emu.resume()
+        self._notify_frame_change()
         return f"ROM loaded: {path.name}"
 
     def _require_rom(self) -> DeSmuME:
@@ -142,6 +158,7 @@ class EmulatorState:
         """Advance multiple frames holding the same input. Returns frames advanced."""
         for _ in range(count):
             self.advance_frame(buttons, touch_x, touch_y)
+        self._notify_frame_change()
         return count
 
     def press_buttons(self, buttons: list[str], frames: int = 1) -> None:
@@ -151,6 +168,7 @@ class EmulatorState:
             self.advance_frame(buttons)
         # Release
         self.advance_frame()
+        self._notify_frame_change()
 
     def tap_touch_screen(self, x: int, y: int, frames: int = 1) -> None:
         """Tap the touchscreen for N frames, then release for 1 frame."""
@@ -158,6 +176,7 @@ class EmulatorState:
             self.advance_frame(touch_x=x, touch_y=y)
         # Release
         self.advance_frame()
+        self._notify_frame_change()
 
     def run_macro_steps(self, steps: list[dict]) -> int:
         """Execute a list of macro steps. Returns total frames advanced."""
@@ -181,6 +200,7 @@ class EmulatorState:
                 )
             else:
                 raise ValueError(f"Unknown macro action: {action!r}")
+        self._notify_frame_change()
         return self.frame_count - frames_before
 
     def capture_screenshot(

@@ -180,6 +180,7 @@ def _tool_load_state(holder: EmulatorState, name: str) -> dict[str, Any]:
     if not Path(path).exists():
         raise FileNotFoundError(f"Savestate not found: {name}")
     success = holder.emu.savestate_load(path)
+    holder._notify_frame_change()
     return {"success": success, "name": name, "total_frame": holder.frame_count}
 
 
@@ -199,6 +200,7 @@ def _tool_reset(holder: EmulatorState) -> dict[str, Any]:
     emu = holder._require_rom()
     emu.reset()
     holder.frame_count = 0
+    holder._notify_frame_change()
     return {"success": True, "message": "NDS reset.", "total_frame": 0}
 
 
@@ -896,6 +898,35 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
     def load_rom(rom_path: str) -> dict[str, Any]:
         """Load a Nintendo DS ROM (.nds) file. Requires init_emulator first."""
         return _tool_load_rom(holder, rom_path)
+
+    @mcp.tool()
+    def start_viewer(port: int = 8090) -> dict[str, Any]:
+        """Start a web viewer that streams the DS screens to a browser.
+
+        Opens a lightweight HTTP server on the given port. Navigate to
+        http://localhost:<port> to see both DS screens updating live after
+        every MCP command that advances frames.
+
+        Args:
+            port: HTTP port to listen on (default 8090).
+        """
+        from .viewer import ViewerServer
+
+        if hasattr(holder, "_viewer") and holder._viewer is not None:
+            return {
+                "success": True,
+                "message": f"Viewer already running on port {holder._viewer.port}.",
+                "url": f"http://localhost:{holder._viewer.port}",
+            }
+        viewer = ViewerServer(holder, port=port)
+        viewer.start()
+        holder._viewer = viewer
+        holder.on_frame_change(viewer.notify)
+        return {
+            "success": True,
+            "message": f"Viewer started on port {port}.",
+            "url": f"http://localhost:{port}",
+        }
 
     @mcp.tool()
     def advance_frames(
