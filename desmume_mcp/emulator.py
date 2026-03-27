@@ -86,6 +86,12 @@ class EmulatorState:
         d.mkdir(exist_ok=True)
         return d
 
+    @property
+    def screenshots_dir(self) -> Path:
+        d = self.data_dir / "screenshots"
+        d.mkdir(exist_ok=True)
+        return d
+
     def initialize(self) -> str:
         """Initialize the DeSmuME engine. Must be called first."""
         if self.is_initialized:

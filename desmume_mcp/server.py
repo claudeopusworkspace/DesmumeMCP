@@ -910,7 +910,7 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         Args:
             port: HTTP port to listen on (default 8090).
         """
-        from .viewer import ViewerServer
+        from .viewer import ViewerServer, archive_old_screenshots
 
         if hasattr(holder, "_viewer") and holder._viewer is not None:
             return {
@@ -918,15 +918,20 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
                 "message": f"Viewer already running on port {holder._viewer.port}.",
                 "url": f"http://localhost:{holder._viewer.port}",
             }
+        # Archive leftover screenshots from previous sessions
+        archived = archive_old_screenshots(holder.screenshots_dir)
         viewer = ViewerServer(holder, port=port)
         viewer.start()
         holder._viewer = viewer
         holder.on_frame_change(viewer.notify)
-        return {
+        result: dict[str, Any] = {
             "success": True,
             "message": f"Viewer started on port {port}.",
             "url": f"http://localhost:{port}",
         }
+        if archived:
+            result["archived_screenshots"] = str(archived)
+        return result
 
     @mcp.tool()
     def advance_frames(

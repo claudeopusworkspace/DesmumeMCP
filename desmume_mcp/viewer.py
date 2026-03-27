@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import shutil
 import threading
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -119,12 +122,13 @@ h1 {
     var modeBadge  = document.getElementById('mode-badge');
     var historyPos = document.getElementById('history-pos');
 
-    var history  = [];    // ordered list of frame numbers
-    var live     = true;  // true = showing latest, auto-updating
-    var browseIdx = -1;   // index into history when browsing
+    var history   = [];    // ordered list of frame numbers
+    var live      = true;  // true = showing latest, auto-updating
+    var browseIdx = -1;    // index into history when browsing
+    var sessionId = '';    // prevents cross-session cache collisions
 
     function showFrame(frame) {
-        screen.src = '/screenshot?frame=' + frame;
+        screen.src = '/screenshot?frame=' + frame + '&s=' + sessionId;
         frameTxt.textContent = frame;
     }
 
@@ -198,7 +202,9 @@ h1 {
         });
 
         es.addEventListener('init', function(e) {
-            onFrame(JSON.parse(e.data).frame);
+            var d = JSON.parse(e.data);
+            sessionId = d.session || '';
+            onFrame(d.frame);
         });
 
         es.onerror = function() {
@@ -285,7 +291,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         try:
             # Send current frame immediately so the page is up-to-date
             frame = viewer.get_current_frame()
-            self._sse_write("init", json.dumps({"frame": frame}))
+            self._sse_write("init", json.dumps({"frame": frame, "session": viewer.session_id}))
 
             while True:
                 try:
@@ -308,6 +314,34 @@ class _ViewerHandler(BaseHTTPRequestHandler):
 # -- Public API ------------------------------------------------------------
 
 
+def archive_old_screenshots(screenshots_dir: Path) -> Path | None:
+    """Move any existing screenshots into an archive subdirectory.
+
+    Returns the archive path if files were moved, or None if nothing to archive.
+    """
+    if not screenshots_dir.is_dir():
+        return None
+
+    files = [f for f in screenshots_dir.iterdir() if f.is_file()]
+    if not files:
+        return None
+
+    archive_dir = screenshots_dir / "archive"
+    # Use the oldest file's mtime as the session label
+    oldest = min(files, key=lambda f: f.stat().st_mtime)
+    from datetime import datetime, timezone
+
+    ts = datetime.fromtimestamp(oldest.stat().st_mtime, tz=timezone.utc)
+    session_dir = archive_dir / ts.strftime("%Y%m%d_%H%M%S")
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    for f in files:
+        shutil.move(str(f), str(session_dir / f.name))
+
+    logger.info("Archived %d screenshot(s) to %s", len(files), session_dir)
+    return session_dir
+
+
 class ViewerServer:
     """Streams DS screenshots to a browser via SSE.
 
@@ -324,6 +358,7 @@ class ViewerServer:
     def __init__(self, holder: EmulatorState, port: int = 8090):
         self._holder = holder
         self._port = port
+        self._session_id = uuid.uuid4().hex[:12]
         self._clients: list[queue.Queue[str]] = []
         self._clients_lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
@@ -337,6 +372,10 @@ class ViewerServer:
     @property
     def port(self) -> int:
         return self._port
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
 
     # -- lifecycle ---------------------------------------------------------
 
