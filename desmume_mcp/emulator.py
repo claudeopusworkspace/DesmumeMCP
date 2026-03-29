@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import logging
 import os
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -22,6 +25,104 @@ from .constants import (
     buttons_to_bitmask,
 )
 from .libdesmume import DeSmuME
+
+
+@dataclass
+class Checkpoint:
+    """A savestate checkpoint taken automatically before an input action."""
+
+    id: str
+    frame: int
+    action: str
+    timestamp: float
+    path: str
+
+
+class CheckpointManager:
+    """Ring buffer of automatic savestate checkpoints (max 300)."""
+
+    MAX_CHECKPOINTS = 300
+
+    def __init__(self, checkpoints_dir: Path):
+        self._dir = checkpoints_dir
+        self._dir.mkdir(exist_ok=True)
+        self._ring: deque[Checkpoint] = deque(maxlen=self.MAX_CHECKPOINTS)
+        self._counter = 0
+
+    def create(self, emu: "DeSmuME", frame_count: int, action: str) -> Checkpoint:
+        """Save the current emulator state as a checkpoint before an action."""
+        self._counter += 1
+        raw = f"{time.time():.6f}:{frame_count}:{self._counter}"
+        hash_id = hashlib.sha256(raw.encode()).hexdigest()[:8]
+
+        # If at capacity, the deque will auto-drop the oldest — delete its file
+        if len(self._ring) == self._ring.maxlen:
+            oldest = self._ring[0]
+            Path(oldest.path).unlink(missing_ok=True)
+
+        path = str(self._dir / f"{hash_id}.dst")
+        emu.savestate_save(path)
+
+        cp = Checkpoint(
+            id=hash_id,
+            frame=frame_count,
+            action=action,
+            timestamp=time.time(),
+            path=path,
+        )
+        self._ring.append(cp)
+        return cp
+
+    def list_recent(self, limit: int = 20) -> list[Checkpoint]:
+        """Return recent checkpoints in chronological order (oldest first)."""
+        items = list(self._ring)
+        if 0 < limit < len(items):
+            items = items[-limit:]
+        return items
+
+    @property
+    def total_count(self) -> int:
+        return len(self._ring)
+
+    def get(self, checkpoint_id: str) -> Checkpoint | None:
+        """Find a checkpoint by its hash ID."""
+        for cp in self._ring:
+            if cp.id == checkpoint_id:
+                return cp
+        return None
+
+    def revert(self, holder: "EmulatorState", checkpoint_id: str) -> Checkpoint:
+        """Load a checkpoint and discard all checkpoints after it."""
+        cp = self.get(checkpoint_id)
+        if cp is None:
+            raise ValueError(f"Checkpoint not found: {checkpoint_id!r}")
+
+        if not Path(cp.path).exists():
+            raise FileNotFoundError(f"Checkpoint file missing: {cp.path}")
+
+        emu = holder._require_rom()
+        emu.savestate_load(cp.path)
+        holder.frame_count = cp.frame
+
+        # Remove all checkpoints after the reverted one
+        items = list(self._ring)
+        idx = next(i for i, item in enumerate(items) if item.id == checkpoint_id)
+        for item in items[idx + 1 :]:
+            Path(item.path).unlink(missing_ok=True)
+        self._ring.clear()
+        self._ring.extend(items[: idx + 1])
+
+        holder._notify_frame_change()
+        return cp
+
+    def clear(self) -> int:
+        """Delete all checkpoint files and reset the buffer. Returns count deleted."""
+        count = len(self._ring)
+        for cp in self._ring:
+            Path(cp.path).unlink(missing_ok=True)
+        self._ring.clear()
+        self._counter = 0
+        return count
 
 
 def _ensure_headless_env() -> None:
@@ -43,6 +144,7 @@ class EmulatorState:
     data_dir: Path = field(default_factory=lambda: Path.cwd())
     lock: threading.Lock = field(default_factory=threading.Lock)
     _frame_callbacks: list[Callable[[], None]] = field(default_factory=list)
+    _checkpoints: CheckpointManager | None = field(default=None, init=False, repr=False)
 
     def on_frame_change(self, callback: Callable[[], None]) -> None:
         """Register a callback invoked after any operation that changes frames."""
@@ -55,6 +157,18 @@ class EmulatorState:
                 cb()
             except Exception:
                 logging.getLogger(__name__).debug("frame callback error", exc_info=True)
+
+    @property
+    def checkpoints_dir(self) -> Path:
+        d = self.data_dir / "checkpoints"
+        d.mkdir(exist_ok=True)
+        return d
+
+    @property
+    def checkpoints(self) -> CheckpointManager:
+        if self._checkpoints is None:
+            self._checkpoints = CheckpointManager(self.checkpoints_dir)
+        return self._checkpoints
 
     @property
     def savestates_dir(self) -> Path:

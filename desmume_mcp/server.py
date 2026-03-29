@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -104,11 +105,17 @@ def _tool_press_buttons(
         raise ValueError("Must specify at least one button.")
     if frames < 1 or frames > MAX_ADVANCE_FRAMES:
         raise ValueError(f"frames must be 1-{MAX_ADVANCE_FRAMES}")
+    emu = holder._require_rom()
+    desc = f"press: {', '.join(buttons)}"
+    if frames > 1:
+        desc += f" ({frames}f)"
+    cp = holder.checkpoints.create(emu, holder.frame_count, desc)
     holder.press_buttons(buttons, frames)
     return {
         "buttons": buttons,
         "held_frames": frames,
         "total_frame": holder.frame_count,
+        "checkpoint_id": cp.id,
     }
 
 
@@ -121,8 +128,19 @@ def _tool_tap_touch_screen(
         raise ValueError("y must be 0-191")
     if frames < 1 or frames > MAX_ADVANCE_FRAMES:
         raise ValueError(f"frames must be 1-{MAX_ADVANCE_FRAMES}")
+    emu = holder._require_rom()
+    desc = f"tap: ({x}, {y})"
+    if frames > 1:
+        desc += f" ({frames}f)"
+    cp = holder.checkpoints.create(emu, holder.frame_count, desc)
     holder.tap_touch_screen(x, y, frames)
-    return {"x": x, "y": y, "held_frames": frames, "total_frame": holder.frame_count}
+    return {
+        "x": x,
+        "y": y,
+        "held_frames": frames,
+        "total_frame": holder.frame_count,
+        "checkpoint_id": cp.id,
+    }
 
 
 def _tool_get_screenshot(
@@ -202,6 +220,46 @@ def _tool_reset(holder: EmulatorState) -> dict[str, Any]:
     holder.frame_count = 0
     holder._notify_frame_change()
     return {"success": True, "message": "NDS reset.", "total_frame": 0}
+
+
+def _tool_list_checkpoints(
+    holder: EmulatorState, limit: int
+) -> dict[str, Any]:
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    checkpoints = holder.checkpoints.list_recent(limit)
+    return {
+        "total_checkpoints": holder.checkpoints.total_count,
+        "showing": len(checkpoints),
+        "checkpoints": [
+            {
+                "id": cp.id,
+                "frame": cp.frame,
+                "action": cp.action,
+                "time": datetime.fromtimestamp(cp.timestamp).strftime("%H:%M:%S"),
+            }
+            for cp in checkpoints
+        ],
+    }
+
+
+def _tool_revert_to_checkpoint(
+    holder: EmulatorState, checkpoint_id: str
+) -> dict[str, Any]:
+    before_count = holder.checkpoints.total_count
+    cp = holder.checkpoints.revert(holder, checkpoint_id)
+    discarded = before_count - holder.checkpoints.total_count
+    return {
+        "success": True,
+        "reverted_to": {
+            "id": cp.id,
+            "frame": cp.frame,
+            "action": cp.action,
+        },
+        "total_frame": holder.frame_count,
+        "remaining_checkpoints": holder.checkpoints.total_count,
+        "discarded_checkpoints": discarded,
+    }
 
 
 def _tool_read_memory(
@@ -544,7 +602,7 @@ def _tool_list_macros(holder: EmulatorState) -> dict[str, Any]:
 def _tool_run_macro(
     holder: EmulatorState, name: str, repeat: int
 ) -> dict[str, Any]:
-    holder._require_rom()
+    emu = holder._require_rom()
     if repeat < 1 or repeat > MAX_MACRO_REPEAT:
         raise ValueError(f"repeat must be 1-{MAX_MACRO_REPEAT}")
     path = holder.macros_dir / f"{name}.json"
@@ -553,6 +611,11 @@ def _tool_run_macro(
     data = json.loads(path.read_text())
     steps = data["steps"]
     _validate_macro_steps(steps)
+
+    desc = f"macro: {name}"
+    if repeat > 1:
+        desc += f" (x{repeat})"
+    cp = holder.checkpoints.create(emu, holder.frame_count, desc)
 
     total_frames = 0
     for _ in range(repeat):
@@ -563,6 +626,7 @@ def _tool_run_macro(
         "repeat": repeat,
         "frames_advanced": total_frames,
         "total_frame": holder.frame_count,
+        "checkpoint_id": cp.id,
     }
 
 
@@ -1038,6 +1102,32 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
     def reset_emulator() -> dict[str, Any]:
         """Reset the NDS. Equivalent to power cycling the console."""
         return _tool_reset(holder)
+
+    # ── Checkpoints (automatic rewind history) ──
+
+    @mcp.tool()
+    def list_checkpoints(limit: int = 20) -> dict[str, Any]:
+        """List recent automatic checkpoints in chronological order.
+
+        Checkpoints are saved automatically before every input action (press_buttons,
+        tap_touch_screen, run_macro). Use revert_to_checkpoint to go back in time.
+
+        Args:
+            limit: How many recent checkpoints to show (default 20). Max 300.
+        """
+        return _tool_list_checkpoints(holder, limit)
+
+    @mcp.tool()
+    def revert_to_checkpoint(checkpoint_id: str) -> dict[str, Any]:
+        """Revert the emulator to a previous checkpoint, undoing all actions after it.
+
+        Loads the savestate from before that action was executed and discards all
+        later checkpoints. Use list_checkpoints to find the ID to revert to.
+
+        Args:
+            checkpoint_id: The 8-character hash ID of the checkpoint (from list_checkpoints).
+        """
+        return _tool_revert_to_checkpoint(holder, checkpoint_id)
 
     # ── Memory ──
 
