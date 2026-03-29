@@ -143,6 +143,18 @@ class EmulatorClient:
         """Get current frame count."""
         return self._call("get_frame_count")["frame_count"]
 
+    def create_checkpoint(self, action: str = "manual") -> dict:
+        """Create a checkpoint at the current emulator state. Returns checkpoint info."""
+        return self._call("create_checkpoint", action=action)
+
+    def list_checkpoints(self, limit: int = 20) -> dict:
+        """List recent checkpoints. Returns dict with total count and checkpoint list."""
+        return self._call("list_checkpoints", limit=limit)
+
+    def revert_to_checkpoint(self, checkpoint_id: str) -> dict:
+        """Revert to a checkpoint by hash ID, discarding all later checkpoints."""
+        return self._call("revert_to_checkpoint", checkpoint_id=checkpoint_id)
+
     def get_screenshot(self, screen: str = "both", fmt: str = "png") -> tuple[str, bytes]:
         """Capture screenshot. Returns (mime_type, image_bytes)."""
         import base64

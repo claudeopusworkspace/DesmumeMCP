@@ -297,3 +297,72 @@ class TestToolIntegration:
         assert result["reverted_to"]["id"] == r1["checkpoint_id"]
         assert result["remaining_checkpoints"] == 1
         assert result["discarded_checkpoints"] == 2
+
+
+class TestBridgeCheckpoints:
+    """Test checkpoint methods exposed through the bridge server."""
+
+    def test_create_checkpoint(self, holder):
+        from desmume_mcp.bridge import BridgeServer
+
+        bridge = BridgeServer(holder, "/tmp/test.sock")
+        result = bridge._create_checkpoint(action="bridge: heal party")
+        assert len(result["checkpoint_id"]) == 8
+        assert result["frame"] == holder.frame_count
+        assert result["action"] == "bridge: heal party"
+        assert holder.checkpoints.total_count == 1
+
+    def test_create_checkpoint_default_action(self, holder):
+        from desmume_mcp.bridge import BridgeServer
+
+        bridge = BridgeServer(holder, "/tmp/test.sock")
+        result = bridge._create_checkpoint()
+        assert result["action"] == "manual"
+
+    def test_list_checkpoints(self, holder):
+        from desmume_mcp.bridge import BridgeServer
+
+        bridge = BridgeServer(holder, "/tmp/test.sock")
+        bridge._create_checkpoint(action="step 1")
+        bridge._create_checkpoint(action="step 2")
+        bridge._create_checkpoint(action="step 3")
+
+        result = bridge._list_checkpoints(limit=2)
+        assert result["total_checkpoints"] == 3
+        assert result["showing"] == 2
+        assert result["checkpoints"][0]["action"] == "step 2"
+        assert result["checkpoints"][1]["action"] == "step 3"
+        assert "time" in result["checkpoints"][0]
+
+    def test_revert_to_checkpoint(self, holder):
+        from desmume_mcp.bridge import BridgeServer
+
+        bridge = BridgeServer(holder, "/tmp/test.sock")
+        r1 = bridge._create_checkpoint(action="step 1")
+        bridge._create_checkpoint(action="step 2")
+        bridge._create_checkpoint(action="step 3")
+
+        result = bridge._revert_to_checkpoint(r1["checkpoint_id"])
+        assert result["reverted_to"]["id"] == r1["checkpoint_id"]
+        assert result["remaining_checkpoints"] == 1
+        assert result["discarded_checkpoints"] == 2
+
+    def test_shared_history_with_mcp_tools(self, holder):
+        """Bridge and MCP tool checkpoints share the same history."""
+        from desmume_mcp.bridge import BridgeServer
+        from desmume_mcp.server import _tool_press_buttons
+
+        bridge = BridgeServer(holder, "/tmp/test.sock")
+
+        # MCP tool creates a checkpoint
+        r1 = _tool_press_buttons(holder, ["a"], 1)
+
+        # Bridge creates a checkpoint
+        r2 = bridge._create_checkpoint(action="bridge: navigate")
+
+        # Both visible in the same list
+        result = bridge._list_checkpoints(limit=20)
+        assert result["total_checkpoints"] == 2
+        actions = [cp["action"] for cp in result["checkpoints"]]
+        assert actions[0] == "press: a"
+        assert actions[1] == "bridge: navigate"

@@ -56,6 +56,9 @@ class BridgeServer:
             "load_state": self._load_state,
             "get_status": self._get_status,
             "get_frame_count": self._get_frame_count,
+            "create_checkpoint": self._create_checkpoint,
+            "list_checkpoints": self._list_checkpoints,
+            "revert_to_checkpoint": self._revert_to_checkpoint,
         }
 
     # ── Method handlers ──
@@ -161,6 +164,40 @@ class BridgeServer:
 
     def _get_frame_count(self) -> dict:
         return {"frame_count": self._holder.frame_count}
+
+    def _create_checkpoint(self, action: str = "manual") -> dict:
+        emu = self._holder._require_rom()
+        cp = self._holder.checkpoints.create(emu, self._holder.frame_count, action)
+        return {"checkpoint_id": cp.id, "frame": cp.frame, "action": cp.action}
+
+    def _list_checkpoints(self, limit: int = 20) -> dict:
+        from datetime import datetime
+
+        checkpoints = self._holder.checkpoints.list_recent(limit)
+        return {
+            "total_checkpoints": self._holder.checkpoints.total_count,
+            "showing": len(checkpoints),
+            "checkpoints": [
+                {
+                    "id": cp.id,
+                    "frame": cp.frame,
+                    "action": cp.action,
+                    "time": datetime.fromtimestamp(cp.timestamp).strftime("%H:%M:%S"),
+                }
+                for cp in checkpoints
+            ],
+        }
+
+    def _revert_to_checkpoint(self, checkpoint_id: str) -> dict:
+        before_count = self._holder.checkpoints.total_count
+        cp = self._holder.checkpoints.revert(self._holder, checkpoint_id)
+        discarded = before_count - self._holder.checkpoints.total_count
+        return {
+            "reverted_to": {"id": cp.id, "frame": cp.frame, "action": cp.action},
+            "total_frame": self._holder.frame_count,
+            "remaining_checkpoints": self._holder.checkpoints.total_count,
+            "discarded_checkpoints": discarded,
+        }
 
     # ── Server lifecycle ──
 
