@@ -1,0 +1,4 @@
+[submodule "desmume-src"]
+	path = desmume-src
+	url = https://github.com/claudeopusworkspace/desmume.git
+	branch = feat/mcp-audio-capture
