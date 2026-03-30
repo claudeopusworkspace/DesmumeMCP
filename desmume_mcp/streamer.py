@@ -86,6 +86,19 @@ h1 {
 .dot.playing   { background: #4caf50; }
 .dot.error     { background: #f44336; }
 .dot.waiting   { background: #666; }
+#unmute-btn {
+    padding: 6px 16px;
+    border: 1px solid #555;
+    border-radius: 4px;
+    background: #2e7d32;
+    color: #fff;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    letter-spacing: 1px;
+}
+#unmute-btn:hover { background: #388e3c; }
+#unmute-btn.muted { background: #c62828; }
 </style>
 </head>
 <body>
@@ -94,16 +107,25 @@ h1 {
     <video id="player" muted autoplay></video>
     <div id="status-bar">
         <span><span id="dot" class="dot waiting"></span><span id="status">Waiting for stream\u2026</span></span>
+        <button id="unmute-btn" class="muted">UNMUTE</button>
         <span>Buffer: <span id="buffer-info">\u2014</span></span>
     </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
 (function() {
-    var video  = document.getElementById('player');
-    var dot    = document.getElementById('dot');
-    var status = document.getElementById('status');
-    var bufInfo = document.getElementById('buffer-info');
+    var video    = document.getElementById('player');
+    var dot      = document.getElementById('dot');
+    var status   = document.getElementById('status');
+    var bufInfo  = document.getElementById('buffer-info');
+    var muteBtn  = document.getElementById('unmute-btn');
+
+    muteBtn.addEventListener('click', function() {
+        video.muted = !video.muted;
+        muteBtn.textContent = video.muted ? 'UNMUTE' : 'MUTE';
+        muteBtn.className = video.muted ? 'muted' : '';
+        muteBtn.id = 'unmute-btn';
+    });
 
     function updateBufferInfo() {
         if (video.buffered.length > 0) {
