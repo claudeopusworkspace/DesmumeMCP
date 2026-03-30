@@ -99,6 +99,13 @@ h1 {
 }
 #unmute-btn:hover { background: #388e3c; }
 #unmute-btn.muted { background: #c62828; }
+#volume-slider {
+    width: 80px;
+    vertical-align: middle;
+    cursor: pointer;
+    accent-color: #4caf50;
+}
+#vol-label { font-size: 12px; color: #888; }
 </style>
 </head>
 <body>
@@ -108,6 +115,8 @@ h1 {
     <div id="status-bar">
         <span><span id="dot" class="dot waiting"></span><span id="status">Waiting for stream\u2026</span></span>
         <button id="unmute-btn" class="muted">UNMUTE</button>
+        <input id="volume-slider" type="range" min="0" max="100" value="50">
+        <span id="vol-label">50%</span>
         <span>Buffer: <span id="buffer-info">\u2014</span></span>
     </div>
 </div>
@@ -119,12 +128,21 @@ h1 {
     var status   = document.getElementById('status');
     var bufInfo  = document.getElementById('buffer-info');
     var muteBtn  = document.getElementById('unmute-btn');
+    var volSlider = document.getElementById('volume-slider');
+    var volLabel  = document.getElementById('vol-label');
+
+    video.volume = 0.5;
 
     muteBtn.addEventListener('click', function() {
         video.muted = !video.muted;
         muteBtn.textContent = video.muted ? 'UNMUTE' : 'MUTE';
         muteBtn.className = video.muted ? 'muted' : '';
         muteBtn.id = 'unmute-btn';
+    });
+
+    volSlider.addEventListener('input', function() {
+        video.volume = volSlider.value / 100;
+        volLabel.textContent = volSlider.value + '%';
     });
 
     function updateBufferInfo() {
