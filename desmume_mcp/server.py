@@ -998,6 +998,39 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         return result
 
     @mcp.tool()
+    def start_video_stream(port: int = 8091) -> dict[str, Any]:
+        """Start an HLS video stream of the DS gameplay with audio.
+
+        Launches ffmpeg to encode raw frames and audio into an HLS stream
+        served on the given port. Navigate to http://localhost:<port> to
+        watch gameplay in real-time with audio. Every emulated frame is
+        captured and encoded; the browser buffers and plays back at 60fps.
+
+        This is separate from the screenshot viewer (start_viewer) which
+        is designed for debugging with frame-by-frame history browsing.
+
+        Args:
+            port: HTTP port to listen on (default 8091).
+        """
+        from .streamer import HLSStreamer
+
+        if hasattr(holder, "_streamer") and holder._streamer is not None:
+            return {
+                "success": True,
+                "message": f"Video stream already running on port {holder._streamer.port}.",
+                "url": f"http://localhost:{holder._streamer.port}",
+            }
+
+        streamer = HLSStreamer(holder, port=port)
+        streamer.start()
+        holder._streamer = streamer
+        return {
+            "success": True,
+            "message": f"HLS video stream started on port {port}. Open in browser to watch gameplay with audio.",
+            "url": f"http://localhost:{port}",
+        }
+
+    @mcp.tool()
     def advance_frames(
         count: int = 1,
         buttons: list[str] = [],

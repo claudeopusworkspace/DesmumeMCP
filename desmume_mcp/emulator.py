@@ -144,11 +144,35 @@ class EmulatorState:
     data_dir: Path = field(default_factory=lambda: Path.cwd())
     lock: threading.Lock = field(default_factory=threading.Lock)
     _frame_callbacks: list[Callable[[], None]] = field(default_factory=list)
+    _cycle_callbacks: list[Callable[[], None]] = field(default_factory=list)
     _checkpoints: CheckpointManager | None = field(default=None, init=False, repr=False)
 
     def on_frame_change(self, callback: Callable[[], None]) -> None:
         """Register a callback invoked after any operation that changes frames."""
         self._frame_callbacks.append(callback)
+
+    def on_each_cycle(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked after every single emulated frame.
+
+        Unlike on_frame_change (fires once per MCP action batch), this fires
+        after *every* cycle. Used by the HLS streamer to capture each frame.
+        """
+        self._cycle_callbacks.append(callback)
+
+    def remove_cycle_callback(self, callback: Callable[[], None]) -> None:
+        """Remove a previously registered per-cycle callback."""
+        try:
+            self._cycle_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def _notify_cycle(self) -> None:
+        """Fire all registered per-cycle callbacks."""
+        for cb in self._cycle_callbacks:
+            try:
+                cb()
+            except Exception:
+                logging.getLogger(__name__).debug("cycle callback error", exc_info=True)
 
     def _notify_frame_change(self) -> None:
         """Fire all registered frame-change callbacks."""
@@ -267,6 +291,7 @@ class EmulatorState:
 
         emu.cycle(with_joystick=False)
         self.frame_count += 1
+        self._notify_cycle()
 
     def advance_frames(
         self,

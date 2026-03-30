@@ -46,11 +46,16 @@ class DeSmuME:
     # Pre-allocated screenshot buffer (256x384 RGB = 294912 bytes)
     _SCREENSHOT_SIZE = 98304 * 3
 
+    # Pre-allocated audio read buffer (~735 samples/frame * 60 frames = ~1 sec)
+    _AUDIO_READ_FRAMES = 44100
+    _AUDIO_BUF_SIZE = _AUDIO_READ_FRAMES * 2  # stereo s16
+
     def __init__(self) -> None:
         lib_path = _find_library()
         self._lib = ctypes.CDLL(lib_path)
         self._setup_signatures()
         self._screenshot_buf = (ctypes.c_char * self._SCREENSHOT_SIZE)()
+        self._audio_buf = (ctypes.c_short * self._AUDIO_BUF_SIZE)()
 
     def _setup_signatures(self) -> None:
         lib = self._lib
@@ -82,6 +87,22 @@ class DeSmuME:
 
         lib.desmume_skip_next_frame.argtypes = []
         lib.desmume_skip_next_frame.restype = None
+
+        # ── Audio capture ──
+        lib.desmume_audio_enable_capture.argtypes = []
+        lib.desmume_audio_enable_capture.restype = None
+
+        lib.desmume_audio_disable_capture.argtypes = []
+        lib.desmume_audio_disable_capture.restype = None
+
+        lib.desmume_audio_samples_available.argtypes = []
+        lib.desmume_audio_samples_available.restype = ctypes.c_uint
+
+        lib.desmume_audio_read.argtypes = [
+            ctypes.POINTER(ctypes.c_short),
+            ctypes.c_uint,
+        ]
+        lib.desmume_audio_read.restype = ctypes.c_uint
 
         # ── Display ──
         lib.desmume_screenshot.argtypes = [ctypes.c_char_p]
@@ -356,3 +377,39 @@ class DeSmuME:
         return bool(
             self._lib.desmume_backup_export_file(filename.encode("utf-8"))
         )
+
+    # ── Audio capture ──
+
+    def audio_enable_capture(self) -> None:
+        """Switch to the capture sound core and start accumulating PCM samples."""
+        self._lib.desmume_audio_enable_capture()
+
+    def audio_disable_capture(self) -> None:
+        """Switch back to SDL sound core and stop capturing."""
+        self._lib.desmume_audio_disable_capture()
+
+    def audio_samples_available(self) -> int:
+        """Return number of stereo sample frames available to read."""
+        return self._lib.desmume_audio_samples_available()
+
+    def audio_read(self, max_frames: int = 0) -> bytes:
+        """Read available audio samples as raw s16le stereo PCM bytes.
+
+        Args:
+            max_frames: Max stereo frames to read (0 = all available, up to buffer size).
+
+        Returns:
+            Raw bytes of s16le stereo PCM data (4 bytes per frame: L16 R16).
+        """
+        if max_frames <= 0:
+            max_frames = self._AUDIO_READ_FRAMES
+        if max_frames > self._AUDIO_READ_FRAMES:
+            max_frames = self._AUDIO_READ_FRAMES
+        count = self._lib.desmume_audio_read(self._audio_buf, max_frames)
+        if count == 0:
+            return b""
+        # Return raw bytes: count frames * 2 channels * 2 bytes
+        return bytes(ctypes.cast(
+            self._audio_buf,
+            ctypes.POINTER(ctypes.c_char * (count * 4)),
+        ).contents)
