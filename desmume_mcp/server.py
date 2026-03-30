@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import functools
 import json
 import os
@@ -192,12 +193,28 @@ def _tool_save_state(holder: EmulatorState, name: str) -> dict[str, Any]:
     return {"success": success, "name": name, "path": path}
 
 
+_LOAD_STATE_TIMEOUT = 60  # seconds
+
+
 def _tool_load_state(holder: EmulatorState, name: str) -> dict[str, Any]:
     holder._require_rom()
     path = str(holder.savestates_dir / f"{name}.dst")
     if not Path(path).exists():
         raise FileNotFoundError(f"Savestate not found: {name}")
-    success = holder.emu.savestate_load(path)
+    # Run in a thread with timeout — load_state has a known intermittent hang.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(holder.emu.savestate_load, path)
+        try:
+            success = future.result(timeout=_LOAD_STATE_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            return {
+                "success": False,
+                "name": name,
+                "error": (
+                    "load_state timed out after 60 seconds (known intermittent issue). "
+                    "Please try calling load_state again — it usually succeeds on retry."
+                ),
+            }
     holder._notify_frame_change()
     return {"success": success, "name": name, "total_frame": holder.frame_count}
 
