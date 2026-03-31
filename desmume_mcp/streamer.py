@@ -372,10 +372,12 @@ class HLSStreamer:
         # exactly _SAMPLES_PER_FRAME samples per cycle to keep ffmpeg's
         # audio stream perfectly aligned with the video frame rate.
         self._audio_buf = bytearray()
-        # Real-time rate limiter — prevents content from being produced
-        # faster than 1x, which would cause hls.js to skip to live edge.
+        # Real-time rate limiter state — used by the video writer thread
+        # (not _on_cycle) to prevent content from leading wall-clock by
+        # more than _MAX_BUFFER_SECS.  Keeping the throttle in the writer
+        # thread avoids sleeping while the emulator lock is held.
         self._rt_origin: float | None = None  # wall-clock time of first frame
-        self._rt_frames: int = 0  # frames emitted since origin
+        self._rt_frames: int = 0  # frames written to ffmpeg since origin
 
     @property
     def port(self) -> int:
@@ -483,7 +485,11 @@ class HLSStreamer:
     def _write_fifo(
         self, fifo_path: Path, q: queue.Queue[bytes | None], name: str
     ) -> None:
-        """Writer thread: drains queue and writes to a named pipe."""
+        """Writer thread: drains queue and writes to a named pipe.
+
+        The video writer also performs real-time throttling here (instead of
+        in _on_cycle) so that the emulator lock is never held during sleeps.
+        """
         try:
             with open(fifo_path, "wb") as f:
                 while self._running:
@@ -493,6 +499,26 @@ class HLSStreamer:
                         continue
                     if data is None:
                         break
+                    # Real-time throttle (video writer only) — sleep when
+                    # content is too far ahead of wall-clock to prevent
+                    # hls.js from skipping to the live edge.
+                    if name == "video":
+                        now = time.monotonic()
+                        if self._rt_origin is None:
+                            self._rt_origin = now
+                        else:
+                            self._rt_frames += 1
+                            content_secs = self._rt_frames / _FPS
+                            wall_secs = now - self._rt_origin
+                            ahead = content_secs - wall_secs
+                            if ahead > _MAX_BUFFER_SECS:
+                                sleep_dur = ahead - _MAX_BUFFER_SECS
+                                if sleep_dur > 1.0:
+                                    logger.debug(
+                                        "Streamer throttle: sleeping %.3fs (%.1fs ahead, frame %d, vq=%d)",
+                                        sleep_dur, ahead, self._rt_frames, q.qsize(),
+                                    )
+                                time.sleep(sleep_dur)
                     try:
                         f.write(data)
                     except BrokenPipeError:
@@ -533,33 +559,12 @@ class HLSStreamer:
             normalized = bytes(self._audio_buf) + b"\x00" * (needed - len(self._audio_buf))
             self._audio_buf.clear()
 
-        # Buffer-aware throttle: run full speed until we're _MAX_BUFFER_SECS
-        # ahead of wall-clock, then sleep to maintain that lead.  This lets
-        # the emulator build a comfortable buffer during LLM think time while
-        # preventing hls.js from skipping to the live edge.
-        now = time.monotonic()
-        if self._rt_origin is None:
-            self._rt_origin = now
-            self._rt_frames = 0
-        else:
-            self._rt_frames += 1
-            content_secs = self._rt_frames / _FPS
-            wall_secs = now - self._rt_origin
-            ahead = content_secs - wall_secs
-            if ahead > _MAX_BUFFER_SECS:
-                sleep_dur = ahead - _MAX_BUFFER_SECS
-                if sleep_dur > 1.0:
-                    logger.debug(
-                        "Streamer throttle: sleeping %.3fs (%.1fs ahead of wall-clock, frame %d)",
-                        sleep_dur, ahead, self._holder.frame_count,
-                    )
-                time.sleep(sleep_dur)
-
-        # Push to writer queues — block if full so emulation runs at
-        # encoding speed (backpressure).  Timeout prevents hanging if
-        # ffmpeg dies or the streamer is shutting down.
+        # Non-blocking enqueue — the real-time throttle lives in the video
+        # writer thread (_write_fifo) so that _on_cycle never sleeps while
+        # the emulator lock is held.  If the queue is full the frame is
+        # dropped; the 300-frame (5s) queue provides ample runway.
         try:
-            self._video_queue.put(raw_rgb, timeout=2.0)
+            self._video_queue.put_nowait(raw_rgb)
         except queue.Full:
             logger.warning(
                 "Streamer video queue full — dropped frame %d (qsize=%d)",
@@ -567,7 +572,7 @@ class HLSStreamer:
             )
 
         try:
-            self._audio_queue.put(normalized, timeout=2.0)
+            self._audio_queue.put_nowait(normalized)
         except queue.Full:
             logger.warning(
                 "Streamer audio queue full — dropped frame %d (qsize=%d)",
