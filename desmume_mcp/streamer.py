@@ -134,8 +134,41 @@ h1 {
     var volLabel  = document.getElementById('vol-label');
 
     video.volume = 0.5;
-    var lastFragTime = 0;   // timestamp of last new fragment
-    var paused = false;      // true when we've paused due to no new content
+    var BUFFER_TARGET_SECS = 30;
+    var BUFFER_MAX_WAIT_MS = 120000;  // 2 minutes
+    var bufferingGate = false;
+    var bufferGateStart = 0;
+    var bufferCheckTimer = null;
+    var lastFragTime = 0;
+
+    function getBufferedAhead() {
+        if (video.buffered.length === 0) return 0;
+        return video.buffered.end(video.buffered.length - 1) - video.currentTime;
+    }
+
+    function enterBufferingGate() {
+        bufferingGate = true;
+        bufferGateStart = Date.now();
+        video.pause();
+        setStatus('buffering', 'Buffering\u2026 0s');
+        if (!bufferCheckTimer) {
+            bufferCheckTimer = setInterval(tryExitBufferingGate, 1000);
+        }
+    }
+
+    function tryExitBufferingGate() {
+        if (!bufferingGate) return;
+        var ahead = getBufferedAhead();
+        var waited = Date.now() - bufferGateStart;
+        if (ahead >= BUFFER_TARGET_SECS || waited >= BUFFER_MAX_WAIT_MS) {
+            bufferingGate = false;
+            if (bufferCheckTimer) { clearInterval(bufferCheckTimer); bufferCheckTimer = null; }
+            video.play().catch(function() {});
+            setStatus('playing', 'Playing');
+        } else {
+            setStatus('buffering', 'Buffering\u2026 ' + Math.floor(ahead) + 's');
+        }
+    }
 
     muteBtn.addEventListener('click', function() {
         video.muted = !video.muted;
@@ -172,10 +205,10 @@ h1 {
 
         if (Hls.isSupported()) {
             var hls = new Hls({
-                liveSyncDurationCount: 3,
-                liveMaxLatencyDurationCount: 20,
+                liveSyncDurationCount: 300,
+                liveMaxLatencyDurationCount: 600,
                 enableWorker: true,
-                lowLatencyMode: true,
+                lowLatencyMode: false,
             });
 
             hls.on(Hls.Events.MEDIA_ATTACHED, function() {
@@ -183,17 +216,16 @@ h1 {
             });
 
             hls.on(Hls.Events.MANIFEST_PARSED, function() {
-                setStatus('buffering', 'Buffering\u2026');
-                video.play().catch(function() {});
+                enterBufferingGate();
             });
 
             hls.on(Hls.Events.FRAG_BUFFERED, function() {
                 lastFragTime = Date.now();
-                if (paused) {
-                    paused = false;
-                    video.play().catch(function() {});
+                if (bufferingGate) {
+                    tryExitBufferingGate();
+                } else {
+                    setStatus('playing', 'Playing');
                 }
-                setStatus('playing', 'Playing');
             });
 
             hls.on(Hls.Events.ERROR, function(event, data) {
@@ -204,14 +236,18 @@ h1 {
                 }
             });
 
-            // When the player stalls at the end of buffered content and
-            // no new fragments have arrived recently, pause instead of
-            // letting hls.js loop the live window.
+            // Proactively enter the gate before the buffer fully empties
+            // to prevent hls.js from looping back in the live window.
+            video.addEventListener('timeupdate', function() {
+                if (!bufferingGate && lastFragTime && (Date.now() - lastFragTime) > 3000 && getBufferedAhead() < 2) {
+                    enterBufferingGate();
+                }
+            });
+
+            // Fallback: catch full buffer exhaustion if timeupdate missed it.
             video.addEventListener('waiting', function() {
-                if (lastFragTime && (Date.now() - lastFragTime) > 3000) {
-                    paused = true;
-                    video.pause();
-                    setStatus('buffering', 'Waiting for frames\u2026');
+                if (!bufferingGate && lastFragTime && (Date.now() - lastFragTime) > 3000) {
+                    enterBufferingGate();
                 }
             });
 
