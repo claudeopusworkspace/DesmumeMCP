@@ -378,6 +378,7 @@ class HLSStreamer:
         # thread avoids sleeping while the emulator lock is held.
         self._rt_origin: float | None = None  # wall-clock time of first frame
         self._rt_frames: int = 0  # frames written to ffmpeg since origin
+        self._drop_count: int = 0  # frames dropped due to full queue
 
     @property
     def port(self) -> int:
@@ -490,8 +491,11 @@ class HLSStreamer:
         The video writer also performs real-time throttling here (instead of
         in _on_cycle) so that the emulator lock is never held during sleeps.
         """
+        logger.info("%s writer thread starting (fifo=%s)", name, fifo_path)
+        frames_written = 0
         try:
             with open(fifo_path, "wb") as f:
+                logger.info("%s FIFO opened for writing", name)
                 while self._running:
                     try:
                         data = q.get(timeout=1.0)
@@ -519,14 +523,25 @@ class HLSStreamer:
                                         sleep_dur, ahead, self._rt_frames, q.qsize(),
                                     )
                                 time.sleep(sleep_dur)
+                    t_write = time.monotonic()
                     try:
                         f.write(data)
                     except BrokenPipeError:
                         logger.warning("%s pipe broken", name)
                         break
+                    write_dur = time.monotonic() - t_write
+                    frames_written += 1
+                    if write_dur > 1.0:
+                        logger.warning(
+                            "%s FIFO write blocked %.3fs (frame %d, qsize=%d)",
+                            name, write_dur, frames_written, q.qsize(),
+                        )
         except OSError as e:
             if self._running:
                 logger.error("Error opening %s fifo: %s", name, e)
+        except Exception:
+            logger.error("%s writer thread crashed", name, exc_info=True)
+        logger.info("%s writer thread exiting (wrote %d frames)", name, frames_written)
 
     def _on_cycle(self) -> None:
         """Called after each emulator cycle — push frame + audio to ffmpeg."""
@@ -563,21 +578,29 @@ class HLSStreamer:
         # writer thread (_write_fifo) so that _on_cycle never sleeps while
         # the emulator lock is held.  If the queue is full the frame is
         # dropped; the 300-frame (5s) queue provides ample runway.
+        dropped = False
         try:
             self._video_queue.put_nowait(raw_rgb)
         except queue.Full:
-            logger.warning(
-                "Streamer video queue full — dropped frame %d (qsize=%d)",
-                self._holder.frame_count, self._video_queue.qsize(),
-            )
+            dropped = True
+            self._drop_count += 1
+            # Log first drop and then periodically (every 300 = ~5s at 60fps)
+            if self._drop_count == 1 or self._drop_count % 300 == 0:
+                logger.warning(
+                    "Streamer queue full — dropped %d frames so far (frame %d)",
+                    self._drop_count, self._holder.frame_count,
+                )
 
         try:
             self._audio_queue.put_nowait(normalized)
         except queue.Full:
-            logger.warning(
-                "Streamer audio queue full — dropped frame %d (qsize=%d)",
-                self._holder.frame_count, self._audio_queue.qsize(),
-            )
+            pass  # audio drops are logged implicitly via video drop count
+
+        if dropped:
+            # Yield CPU time so ffmpeg (separate process) can encode and
+            # drain the FIFO pipes.  Without this, a tight emulation loop
+            # starves ffmpeg and the queues stay permanently full.
+            time.sleep(0)
 
         elapsed = time.monotonic() - t_cycle_start
         if elapsed > 0.5:
@@ -592,10 +615,14 @@ class HLSStreamer:
         if not self._running:
             return
 
-        logger.info("HLS streamer shutting down (streamed %d frames)", self._rt_frames)
+        logger.info(
+            "HLS streamer shutting down (wrote %d frames, dropped %d)",
+            self._rt_frames, self._drop_count,
+        )
         self._running = False
         self._rt_origin = None
         self._rt_frames = 0
+        self._drop_count = 0
         self._holder.remove_cycle_callback(self._on_cycle)
 
         # Disable audio capture
