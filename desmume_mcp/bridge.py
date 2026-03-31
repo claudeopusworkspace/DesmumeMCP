@@ -14,13 +14,17 @@ Protocol (line-delimited JSON over Unix domain socket):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from .constants import buttons_to_bitmask
+
+logger = logging.getLogger(__name__)
 
 # Maximum request size (64 KB should be plenty for any single call)
 MAX_REQUEST_SIZE = 65536
@@ -129,6 +133,7 @@ class BridgeServer:
             emu.memory_write_long(address, value)
         else:
             raise ValueError(f"Invalid size: {size}")
+        logger.debug("write_memory addr=0x%08X value=%d size=%s", address, value, size)
         return {"success": True}
 
     def _input_keypad_update(self, keys: int = 0, buttons: list[str] | None = None) -> dict:
@@ -147,11 +152,13 @@ class BridgeServer:
     def _save_state(self, path: str) -> dict:
         emu = self._holder._require_rom()
         success = emu.savestate_save(path)
+        logger.info("save_state path=%s success=%s", path, success)
         return {"success": success, "path": path}
 
     def _load_state(self, path: str) -> dict:
         emu = self._holder._require_rom()
         success = emu.savestate_load(path)
+        logger.info("load_state path=%s success=%s", path, success)
         return {"success": success, "path": path}
 
     def _get_status(self) -> dict:
@@ -215,10 +222,12 @@ class BridgeServer:
 
         self._thread = threading.Thread(target=self._serve_loop, daemon=True)
         self._thread.start()
+        logger.info("Bridge server started on %s", self._socket_path)
         return self._socket_path
 
     def stop(self) -> None:
         """Stop the bridge server."""
+        logger.info("Bridge server stopping")
         self._running = False
         if self._server_sock:
             self._server_sock.close()
@@ -226,6 +235,7 @@ class BridgeServer:
             self._thread.join(timeout=3)
         if os.path.exists(self._socket_path):
             os.unlink(self._socket_path)
+        logger.info("Bridge server stopped")
 
     def _serve_loop(self) -> None:
         """Accept connections and handle requests."""
@@ -236,14 +246,17 @@ class BridgeServer:
                 continue
             except OSError:
                 break
+            peer = f"client-{id(conn):x}"
+            logger.info("Bridge client connected (%s)", peer)
             try:
-                self._handle_connection(conn)
+                self._handle_connection(conn, peer)
             except Exception:
-                pass
+                logger.warning("Unhandled error in bridge connection (%s)", peer, exc_info=True)
             finally:
                 conn.close()
+                logger.info("Bridge client disconnected (%s)", peer)
 
-    def _handle_connection(self, conn: socket.socket) -> None:
+    def _handle_connection(self, conn: socket.socket, peer: str) -> None:
         """Handle a single client connection (may send multiple requests)."""
         buf = b""
         conn.settimeout(30.0)
@@ -251,6 +264,7 @@ class BridgeServer:
             try:
                 chunk = conn.recv(MAX_REQUEST_SIZE)
             except socket.timeout:
+                logger.debug("Bridge recv timeout (%s), closing connection", peer)
                 break
             if not chunk:
                 break
@@ -258,25 +272,61 @@ class BridgeServer:
             # Process complete lines
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
-                response = self._dispatch(line)
+                response = self._dispatch(line, peer)
                 conn.sendall(response.encode("utf-8") + b"\n")
 
-    def _dispatch(self, raw: bytes) -> str:
+    def _dispatch(self, raw: bytes, peer: str) -> str:
         """Parse a JSON request and dispatch to the appropriate handler."""
         try:
             req = json.loads(raw)
         except json.JSONDecodeError as e:
+            logger.warning("Bridge invalid JSON from %s: %s", peer, e)
             return json.dumps({"error": f"Invalid JSON: {e}"})
 
         method = req.get("method")
         if not method or method not in self._methods:
+            logger.warning("Bridge unknown method %r from %s", method, peer)
             return json.dumps({"error": f"Unknown method: {method!r}. Available: {sorted(self._methods.keys())}"})
 
         params = req.get("params", {})
+        logger.debug("Bridge dispatch %s(%s) from %s", method, _summarize_params(params), peer)
 
+        t_lock_start = time.monotonic()
         with self._holder.lock:
+            t_lock_acquired = time.monotonic()
+            lock_wait = t_lock_acquired - t_lock_start
+            if lock_wait > 0.1:
+                logger.warning(
+                    "Bridge lock contention: waited %.3fs for lock (method=%s, peer=%s)",
+                    lock_wait, method, peer,
+                )
             try:
                 result = self._methods[method](**params)
+                elapsed = time.monotonic() - t_lock_acquired
+                if elapsed > 1.0:
+                    logger.info(
+                        "Bridge slow dispatch: %s took %.3fs (peer=%s)",
+                        method, elapsed, peer,
+                    )
+                else:
+                    logger.debug("Bridge dispatch %s completed in %.3fs", method, elapsed)
                 return json.dumps({"result": result})
             except Exception as e:
+                logger.warning(
+                    "Bridge dispatch error: method=%s error=%s (peer=%s)",
+                    method, e, peer, exc_info=True,
+                )
                 return json.dumps({"error": f"{type(e).__name__}: {e}"})
+
+
+def _summarize_params(params: dict) -> str:
+    """Create a short summary of params for logging (avoid dumping huge data)."""
+    parts = []
+    for k, v in params.items():
+        if isinstance(v, str) and len(v) > 80:
+            parts.append(f"{k}=<str len={len(v)}>")
+        elif isinstance(v, (list, dict)) and len(str(v)) > 80:
+            parts.append(f"{k}=<{type(v).__name__} len={len(v)}>")
+        else:
+            parts.append(f"{k}={v!r}")
+    return ", ".join(parts)

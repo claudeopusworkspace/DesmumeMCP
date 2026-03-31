@@ -26,6 +26,8 @@ from .constants import (
 )
 from .libdesmume import DeSmuME
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Checkpoint:
@@ -172,7 +174,7 @@ class EmulatorState:
             try:
                 cb()
             except Exception:
-                logging.getLogger(__name__).debug("cycle callback error", exc_info=True)
+                logger.warning("cycle callback error in %s", cb, exc_info=True)
 
     def _notify_frame_change(self) -> None:
         """Fire all registered frame-change callbacks."""
@@ -180,7 +182,7 @@ class EmulatorState:
             try:
                 cb()
             except Exception:
-                logging.getLogger(__name__).debug("frame callback error", exc_info=True)
+                logger.warning("frame callback error in %s", cb, exc_info=True)
 
     @property
     def checkpoints_dir(self) -> Path:
@@ -233,15 +235,19 @@ class EmulatorState:
     def initialize(self) -> str:
         """Initialize the DeSmuME engine. Must be called first."""
         if self.is_initialized:
+            logger.debug("initialize() called but already initialized")
             return "Already initialized."
 
         _ensure_headless_env()
+        logger.info("Initializing DeSmuME engine")
         self.emu = DeSmuME()
         result = self.emu.init()
         if result == -1:
+            logger.error("desmume_init() failed (returned -1)")
             raise RuntimeError("desmume_init() failed (SDL init error?)")
 
         self.is_initialized = True
+        logger.info("DeSmuME initialized successfully")
         return "DeSmuME initialized successfully."
 
     def load_rom(self, rom_path: str) -> str:
@@ -251,10 +257,13 @@ class EmulatorState:
 
         path = Path(rom_path).resolve()
         if not path.exists():
+            logger.error("ROM not found: %s", path)
             raise FileNotFoundError(f"ROM not found: {path}")
 
+        logger.info("Loading ROM: %s", path)
         result = self.emu.open(str(path))
         if result < 1:
+            logger.error("Failed to load ROM: %s (error code: %d)", path, result)
             raise RuntimeError(f"Failed to load ROM: {path} (error code: {result})")
 
         self.rom_path = str(path)
@@ -262,6 +271,7 @@ class EmulatorState:
         self.frame_count = 0
         self.emu.resume()
         self._notify_frame_change()
+        logger.info("ROM loaded successfully: %s", path.name)
         return f"ROM loaded: {path.name}"
 
     def _require_rom(self) -> DeSmuME:
@@ -301,9 +311,21 @@ class EmulatorState:
         touch_y: int | None = None,
     ) -> int:
         """Advance multiple frames holding the same input. Returns frames advanced."""
+        t0 = time.monotonic()
         for _ in range(count):
             self.advance_frame(buttons, touch_x, touch_y)
+        elapsed = time.monotonic() - t0
         self._notify_frame_change()
+        if count > 1:
+            logger.debug(
+                "advance_frames: %d frames in %.3fs (%.1f fps), now at frame %d",
+                count, elapsed, count / elapsed if elapsed > 0 else 0, self.frame_count,
+            )
+        if elapsed > 5.0:
+            logger.info(
+                "Slow advance_frames: %d frames took %.3fs (buttons=%s, frame=%d)",
+                count, elapsed, buttons, self.frame_count,
+            )
         return count
 
     def press_buttons(self, buttons: list[str], frames: int = 1) -> None:

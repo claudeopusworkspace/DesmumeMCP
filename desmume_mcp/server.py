@@ -5,7 +5,9 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import json
+import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,13 +17,22 @@ from mcp.server.fastmcp import FastMCP
 from .constants import FRAMES_PER_SECOND, VALID_BUTTONS
 from .emulator import EmulatorState
 
+logger = logging.getLogger(__name__)
+
 
 def _with_lock(holder: EmulatorState):
     """Decorator factory — wraps a tool function so it acquires the emulator lock."""
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            t0 = time.monotonic()
             with holder.lock:
+                lock_wait = time.monotonic() - t0
+                if lock_wait > 0.1:
+                    logger.warning(
+                        "MCP lock contention: waited %.3fs for lock (tool=%s)",
+                        lock_wait, fn.__name__,
+                    )
                 return fn(*args, **kwargs)
         return wrapper
     return decorator
@@ -67,15 +78,18 @@ def _start_bridge(holder: EmulatorState) -> str | None:
 
 
 def _tool_init_emulator(holder: EmulatorState) -> dict[str, Any]:
+    logger.info("Tool: init_emulator")
     msg = holder.initialize()
     bridge_path = _start_bridge(holder)
     result: dict[str, Any] = {"success": True, "message": msg}
     if bridge_path:
         result["bridge_socket"] = bridge_path
+    logger.info("init_emulator complete (bridge=%s)", bridge_path)
     return result
 
 
 def _tool_load_rom(holder: EmulatorState, rom_path: str) -> dict[str, Any]:
+    logger.info("Tool: load_rom path=%s", rom_path)
     msg = holder.load_rom(rom_path)
     return {"success": True, "rom_path": holder.rom_path, "message": msg}
 
@@ -187,9 +201,11 @@ def _tool_get_status(holder: EmulatorState) -> dict[str, Any]:
 
 
 def _tool_save_state(holder: EmulatorState, name: str) -> dict[str, Any]:
+    logger.info("Tool: save_state name=%s", name)
     holder._require_rom()
     path = str(holder.savestates_dir / f"{name}.dst")
     success = holder.emu.savestate_save(path)
+    logger.info("save_state completed (name=%s, success=%s)", name, success)
     return {"success": success, "name": name, "path": path}
 
 
@@ -197,16 +213,23 @@ _LOAD_STATE_TIMEOUT = 60  # seconds
 
 
 def _tool_load_state(holder: EmulatorState, name: str) -> dict[str, Any]:
+    logger.info("Tool: load_state name=%s", name)
     holder._require_rom()
     path = str(holder.savestates_dir / f"{name}.dst")
     if not Path(path).exists():
+        logger.warning("load_state: savestate not found: %s", name)
         raise FileNotFoundError(f"Savestate not found: {name}")
     # Run in a thread with timeout — load_state has a known intermittent hang.
+    t0 = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(holder.emu.savestate_load, path)
         try:
             success = future.result(timeout=_LOAD_STATE_TIMEOUT)
         except concurrent.futures.TimeoutError:
+            logger.error(
+                "load_state TIMED OUT after %ds (name=%s, path=%s)",
+                _LOAD_STATE_TIMEOUT, name, path,
+            )
             return {
                 "success": False,
                 "name": name,
@@ -215,6 +238,8 @@ def _tool_load_state(holder: EmulatorState, name: str) -> dict[str, Any]:
                     "Please try calling load_state again — it usually succeeds on retry."
                 ),
             }
+    elapsed = time.monotonic() - t0
+    logger.info("load_state completed in %.3fs (name=%s, success=%s)", elapsed, name, success)
     holder._notify_frame_change()
     return {"success": success, "name": name, "total_frame": holder.frame_count}
 
@@ -232,6 +257,7 @@ def _tool_list_states(holder: EmulatorState) -> dict[str, Any]:
 
 
 def _tool_reset(holder: EmulatorState) -> dict[str, Any]:
+    logger.info("Tool: reset_emulator (was at frame %d)", holder.frame_count)
     emu = holder._require_rom()
     emu.reset()
     holder.frame_count = 0
@@ -993,7 +1019,9 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         """
         from .viewer import ViewerServer, archive_old_screenshots
 
+        logger.info("Tool: start_viewer port=%d", port)
         if hasattr(holder, "_viewer") and holder._viewer is not None:
+            logger.debug("Viewer already running on port %d", holder._viewer.port)
             return {
                 "success": True,
                 "message": f"Viewer already running on port {holder._viewer.port}.",
@@ -1005,6 +1033,7 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         viewer.start()
         holder._viewer = viewer
         holder.on_frame_change(viewer.notify)
+        logger.info("Viewer started on port %d", port)
         result: dict[str, Any] = {
             "success": True,
             "message": f"Viewer started on port {port}.",
@@ -1031,7 +1060,9 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         """
         from .streamer import HLSStreamer
 
+        logger.info("Tool: start_video_stream port=%d", port)
         if hasattr(holder, "_streamer") and holder._streamer is not None:
+            logger.debug("Streamer already running on port %d", holder._streamer.port)
             return {
                 "success": True,
                 "message": f"Video stream already running on port {holder._streamer.port}.",
@@ -1041,6 +1072,7 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         streamer = HLSStreamer(holder, port=port)
         streamer.start()
         holder._streamer = streamer
+        logger.info("HLS video stream started on port %d", port)
         return {
             "success": True,
             "message": f"HLS video stream started on port {port}. Open in browser to watch gameplay with audio.",

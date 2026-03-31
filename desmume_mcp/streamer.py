@@ -511,6 +511,8 @@ class HLSStreamer:
         if emu is None:
             return
 
+        t_cycle_start = time.monotonic()
+
         # Grab raw RGB frame
         raw_rgb = emu.screenshot()
 
@@ -545,7 +547,13 @@ class HLSStreamer:
             wall_secs = now - self._rt_origin
             ahead = content_secs - wall_secs
             if ahead > _MAX_BUFFER_SECS:
-                time.sleep(ahead - _MAX_BUFFER_SECS)
+                sleep_dur = ahead - _MAX_BUFFER_SECS
+                if sleep_dur > 1.0:
+                    logger.debug(
+                        "Streamer throttle: sleeping %.3fs (%.1fs ahead of wall-clock, frame %d)",
+                        sleep_dur, ahead, self._holder.frame_count,
+                    )
+                time.sleep(sleep_dur)
 
         # Push to writer queues — block if full so emulation runs at
         # encoding speed (backpressure).  Timeout prevents hanging if
@@ -553,18 +561,33 @@ class HLSStreamer:
         try:
             self._video_queue.put(raw_rgb, timeout=2.0)
         except queue.Full:
-            pass
+            logger.warning(
+                "Streamer video queue full — dropped frame %d (qsize=%d)",
+                self._holder.frame_count, self._video_queue.qsize(),
+            )
 
         try:
             self._audio_queue.put(normalized, timeout=2.0)
         except queue.Full:
-            pass
+            logger.warning(
+                "Streamer audio queue full — dropped frame %d (qsize=%d)",
+                self._holder.frame_count, self._audio_queue.qsize(),
+            )
+
+        elapsed = time.monotonic() - t_cycle_start
+        if elapsed > 0.5:
+            logger.warning(
+                "Streamer slow _on_cycle: %.3fs (frame %d, vq=%d, aq=%d)",
+                elapsed, self._holder.frame_count,
+                self._video_queue.qsize(), self._audio_queue.qsize(),
+            )
 
     def stop(self) -> None:
         """Shut down ffmpeg and HTTP server."""
         if not self._running:
             return
 
+        logger.info("HLS streamer shutting down (streamed %d frames)", self._rt_frames)
         self._running = False
         self._rt_origin = None
         self._rt_frames = 0
@@ -575,7 +598,7 @@ class HLSStreamer:
             if self._holder.emu is not None:
                 self._holder.emu.audio_disable_capture()
         except Exception:
-            pass
+            logger.warning("Error disabling audio capture during shutdown", exc_info=True)
 
         # Signal writer threads to exit
         try:
@@ -592,8 +615,18 @@ class HLSStreamer:
             self._ffmpeg_proc.terminate()
             try:
                 self._ffmpeg_proc.wait(timeout=5)
+                logger.debug("ffmpeg exited with code %d", self._ffmpeg_proc.returncode)
             except subprocess.TimeoutExpired:
+                logger.warning("ffmpeg did not exit in 5s, killing")
                 self._ffmpeg_proc.kill()
+            # Read any ffmpeg stderr for diagnostics
+            try:
+                stderr = self._ffmpeg_proc.stderr.read()
+                if stderr:
+                    last_lines = stderr.decode("utf-8", errors="replace").strip().splitlines()[-10:]
+                    logger.debug("ffmpeg last stderr:\n  %s", "\n  ".join(last_lines))
+            except Exception:
+                pass
             self._ffmpeg_proc = None
 
         # Stop HTTP server
@@ -606,6 +639,6 @@ class HLSStreamer:
         try:
             shutil.rmtree(self._hls_dir, ignore_errors=True)
         except Exception:
-            pass
+            logger.warning("Error cleaning up HLS temp dir", exc_info=True)
 
         logger.info("HLS streamer stopped")
