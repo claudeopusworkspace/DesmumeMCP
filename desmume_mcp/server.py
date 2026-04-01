@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import functools
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -282,40 +282,80 @@ def _tool_save_state(holder: EmulatorState, name: str) -> dict[str, Any]:
 
 _LOAD_STATE_TIMEOUT = 120  # seconds
 
+# Tools that manage their own locking (excluded from bulk _with_lock wrapping).
+_SELF_LOCKING_TOOLS = {"load_state"}
+
 
 def _tool_load_state(holder: EmulatorState, name: str) -> dict[str, Any]:
+    """Load a savestate with robust timeout handling.
+
+    This function is excluded from the bulk _with_lock wrapping because it
+    needs fine-grained control: the lock is acquired inside the worker thread
+    so the main thread's timeout polling can always fire — even if lock
+    acquisition itself blocks (e.g. another long-running tool holds it).
+    """
     logger.info("Tool: load_state name=%s", name)
     holder._require_rom()
     path = str(holder.savestates_dir / f"{name}.dst")
     if not Path(path).exists():
         logger.warning("load_state: savestate not found: %s", name)
         raise FileNotFoundError(f"Savestate not found: {name}")
-    # Run in a thread with timeout — load_state has a known intermittent hang.
-    # IMPORTANT: We use shutdown(wait=False) so that if the thread hangs, we
-    # don't block forever in ThreadPoolExecutor.__exit__ waiting for it.
+
     t0 = time.monotonic()
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(holder.emu.savestate_load, path)
-    try:
-        success = future.result(timeout=_LOAD_STATE_TIMEOUT)
-    except concurrent.futures.TimeoutError:
-        pool.shutdown(wait=False)
-        elapsed = time.monotonic() - t0
-        logger.error(
-            "load_state TIMED OUT after %ds (name=%s, path=%s)",
-            int(elapsed), name, path,
-        )
+    deadline = t0 + _LOAD_STATE_TIMEOUT
+    done = threading.Event()
+    result_box: list[Any] = [None, None]  # [success_bool, exception]
+
+    def _worker() -> None:
+        try:
+            # Acquire lock inside the worker so the main thread isn't blocked.
+            acquired = holder.lock.acquire(timeout=_LOAD_STATE_TIMEOUT)
+            if not acquired:
+                result_box[1] = TimeoutError("lock acquisition timed out")
+                return
+            try:
+                result_box[0] = holder.emu.savestate_load(path)
+            finally:
+                holder.lock.release()
+        except Exception as exc:
+            result_box[1] = exc
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+
+    # Poll with 1-second granularity so we're never dependent on a single
+    # blocking wait respecting its timeout (belt-and-suspenders).
+    while not done.is_set():
+        if time.monotonic() >= deadline:
+            elapsed = time.monotonic() - t0
+            logger.error(
+                "load_state TIMED OUT after %ds (name=%s, path=%s)",
+                int(elapsed), name, path,
+            )
+            return {
+                "success": False,
+                "name": name,
+                "error": (
+                    f"load_state timed out after {int(elapsed)} seconds "
+                    "(known intermittent issue). "
+                    "Please try calling load_state again — it usually succeeds on retry."
+                ),
+            }
+        done.wait(timeout=1.0)
+
+    elapsed = time.monotonic() - t0
+
+    if result_box[1] is not None:
+        logger.error("load_state failed after %.3fs: %s", elapsed, result_box[1])
         return {
             "success": False,
             "name": name,
-            "error": (
-                "load_state timed out after 120 seconds (known intermittent issue). "
-                "Please try calling load_state again — it usually succeeds on retry."
-            ),
+            "error": str(result_box[1]),
         }
-    else:
-        pool.shutdown(wait=False)
-    elapsed = time.monotonic() - t0
+
+    success = result_box[0]
     logger.info("load_state completed in %.3fs (name=%s, success=%s)", elapsed, name, success)
     holder._notify_frame_change()
     return {"success": success, "name": name, "total_frame": holder.frame_count}
@@ -1558,8 +1598,11 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
     # Wrap all registered tools with the emulator lock so MCP tool calls
     # and bridge calls (from the background thread) never hit the emulator
     # concurrently. DeSmuME is not thread-safe.
+    # Tools in _SELF_LOCKING_TOOLS manage their own lock acquisition (e.g.
+    # load_state acquires inside a worker thread so the timeout can fire).
     lock_wrap = _with_lock(holder)
     for name, tool in mcp._tool_manager._tools.items():
-        tool.fn = lock_wrap(tool.fn)
+        if name not in _SELF_LOCKING_TOOLS:
+            tool.fn = lock_wrap(tool.fn)
 
     return mcp
