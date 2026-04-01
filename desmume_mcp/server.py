@@ -280,7 +280,7 @@ def _tool_save_state(holder: EmulatorState, name: str) -> dict[str, Any]:
     return {"success": success, "name": name, "path": path}
 
 
-_LOAD_STATE_TIMEOUT = 60  # seconds
+_LOAD_STATE_TIMEOUT = 120  # seconds
 
 
 def _tool_load_state(holder: EmulatorState, name: str) -> dict[str, Any]:
@@ -291,24 +291,30 @@ def _tool_load_state(holder: EmulatorState, name: str) -> dict[str, Any]:
         logger.warning("load_state: savestate not found: %s", name)
         raise FileNotFoundError(f"Savestate not found: {name}")
     # Run in a thread with timeout — load_state has a known intermittent hang.
+    # IMPORTANT: We use shutdown(wait=False) so that if the thread hangs, we
+    # don't block forever in ThreadPoolExecutor.__exit__ waiting for it.
     t0 = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(holder.emu.savestate_load, path)
-        try:
-            success = future.result(timeout=_LOAD_STATE_TIMEOUT)
-        except concurrent.futures.TimeoutError:
-            logger.error(
-                "load_state TIMED OUT after %ds (name=%s, path=%s)",
-                _LOAD_STATE_TIMEOUT, name, path,
-            )
-            return {
-                "success": False,
-                "name": name,
-                "error": (
-                    "load_state timed out after 60 seconds (known intermittent issue). "
-                    "Please try calling load_state again — it usually succeeds on retry."
-                ),
-            }
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(holder.emu.savestate_load, path)
+    try:
+        success = future.result(timeout=_LOAD_STATE_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        pool.shutdown(wait=False)
+        elapsed = time.monotonic() - t0
+        logger.error(
+            "load_state TIMED OUT after %ds (name=%s, path=%s)",
+            int(elapsed), name, path,
+        )
+        return {
+            "success": False,
+            "name": name,
+            "error": (
+                "load_state timed out after 120 seconds (known intermittent issue). "
+                "Please try calling load_state again — it usually succeeds on retry."
+            ),
+        }
+    else:
+        pool.shutdown(wait=False)
     elapsed = time.monotonic() - t0
     logger.info("load_state completed in %.3fs (name=%s, success=%s)", elapsed, name, success)
     holder._notify_frame_change()
