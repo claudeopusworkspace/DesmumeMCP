@@ -90,8 +90,79 @@ def _tool_init_emulator(holder: EmulatorState) -> dict[str, Any]:
 
 def _tool_load_rom(holder: EmulatorState, rom_path: str) -> dict[str, Any]:
     logger.info("Tool: load_rom path=%s", rom_path)
+
+    # If the HLS streamer is running, clear its audio buffer before loading
+    # a new ROM to avoid leftover PCM data from the previous game.
+    if hasattr(holder, "_streamer") and holder._streamer is not None:
+        holder._streamer._audio_buf.clear()
+
     msg = holder.load_rom(rom_path)
-    return {"success": True, "rom_path": holder.rom_path, "message": msg}
+    result: dict[str, Any] = {"success": True, "rom_path": holder.rom_path, "message": msg}
+
+    # Auto-start viewer or streamer based on settings
+    from .settings import get_auto_start
+
+    auto = get_auto_start()
+    if auto == "viewer":
+        auto_result = _tool_start_viewer(holder)
+        result["auto_started"] = "viewer"
+        result["viewer_url"] = auto_result.get("url")
+    elif auto == "stream":
+        auto_result = _tool_start_video_stream(holder)
+        result["auto_started"] = "stream"
+        result["stream_url"] = auto_result.get("url")
+
+    return result
+
+
+def _tool_start_viewer(holder: EmulatorState, port: int = 8090) -> dict[str, Any]:
+    from .viewer import ViewerServer, archive_old_screenshots
+
+    logger.info("Tool: start_viewer port=%d", port)
+    if hasattr(holder, "_viewer") and holder._viewer is not None:
+        logger.debug("Viewer already running on port %d", holder._viewer.port)
+        return {
+            "success": True,
+            "message": f"Viewer already running on port {holder._viewer.port}.",
+            "url": f"http://localhost:{holder._viewer.port}",
+        }
+    archived = archive_old_screenshots(holder.screenshots_dir)
+    viewer = ViewerServer(holder, port=port)
+    viewer.start()
+    holder._viewer = viewer
+    holder.on_frame_change(viewer.notify)
+    logger.info("Viewer started on port %d", port)
+    result: dict[str, Any] = {
+        "success": True,
+        "message": f"Viewer started on port {port}.",
+        "url": f"http://localhost:{port}",
+    }
+    if archived:
+        result["archived_screenshots"] = str(archived)
+    return result
+
+
+def _tool_start_video_stream(holder: EmulatorState, port: int = 8091) -> dict[str, Any]:
+    from .streamer import HLSStreamer
+
+    logger.info("Tool: start_video_stream port=%d", port)
+    if hasattr(holder, "_streamer") and holder._streamer is not None:
+        logger.debug("Streamer already running on port %d", holder._streamer.port)
+        return {
+            "success": True,
+            "message": f"Video stream already running on port {holder._streamer.port}.",
+            "url": f"http://localhost:{holder._streamer.port}",
+        }
+
+    streamer = HLSStreamer(holder, port=port)
+    streamer.start()
+    holder._streamer = streamer
+    logger.info("HLS video stream started on port %d", port)
+    return {
+        "success": True,
+        "message": f"HLS video stream started on port {port}. Open in browser to watch gameplay with audio.",
+        "url": f"http://localhost:{port}",
+    }
 
 
 def _tool_advance_frames(
@@ -1017,31 +1088,7 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         Args:
             port: HTTP port to listen on (default 8090).
         """
-        from .viewer import ViewerServer, archive_old_screenshots
-
-        logger.info("Tool: start_viewer port=%d", port)
-        if hasattr(holder, "_viewer") and holder._viewer is not None:
-            logger.debug("Viewer already running on port %d", holder._viewer.port)
-            return {
-                "success": True,
-                "message": f"Viewer already running on port {holder._viewer.port}.",
-                "url": f"http://localhost:{holder._viewer.port}",
-            }
-        # Archive leftover screenshots from previous sessions
-        archived = archive_old_screenshots(holder.screenshots_dir)
-        viewer = ViewerServer(holder, port=port)
-        viewer.start()
-        holder._viewer = viewer
-        holder.on_frame_change(viewer.notify)
-        logger.info("Viewer started on port %d", port)
-        result: dict[str, Any] = {
-            "success": True,
-            "message": f"Viewer started on port {port}.",
-            "url": f"http://localhost:{port}",
-        }
-        if archived:
-            result["archived_screenshots"] = str(archived)
-        return result
+        return _tool_start_viewer(holder, port)
 
     @mcp.tool()
     def start_video_stream(port: int = 8091) -> dict[str, Any]:
@@ -1058,26 +1105,7 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
         Args:
             port: HTTP port to listen on (default 8091).
         """
-        from .streamer import HLSStreamer
-
-        logger.info("Tool: start_video_stream port=%d", port)
-        if hasattr(holder, "_streamer") and holder._streamer is not None:
-            logger.debug("Streamer already running on port %d", holder._streamer.port)
-            return {
-                "success": True,
-                "message": f"Video stream already running on port {holder._streamer.port}.",
-                "url": f"http://localhost:{holder._streamer.port}",
-            }
-
-        streamer = HLSStreamer(holder, port=port)
-        streamer.start()
-        holder._streamer = streamer
-        logger.info("HLS video stream started on port %d", port)
-        return {
-            "success": True,
-            "message": f"HLS video stream started on port {port}. Open in browser to watch gameplay with audio.",
-            "url": f"http://localhost:{port}",
-        }
+        return _tool_start_video_stream(holder, port)
 
     @mcp.tool()
     def advance_frames(

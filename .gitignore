@@ -10,6 +10,9 @@ dist/
 build/
 desmume-src/desmume/src/frontend/interface/build/
 
+# User settings (settings.default.json is the committed template)
+settings.json
+
 # DeSmuME runtime
 savestates/
 movies/

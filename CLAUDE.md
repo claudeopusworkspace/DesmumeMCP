@@ -10,6 +10,7 @@ A Model Context Protocol server that wraps DeSmuME's C interface library, enabli
 - `desmume_mcp/server.py` — FastMCP tool definitions
 - `desmume_mcp/viewer.py` — Screenshot viewer (SSE-based, for debugging)
 - `desmume_mcp/streamer.py` — HLS video streamer (ffmpeg-based, for watching gameplay)
+- `desmume_mcp/settings.py` — Project settings loader (settings.json with defaults fallback)
 - `desmume_mcp/__main__.py` — Entry point (`python -m desmume_mcp`)
 
 ## Build
@@ -39,6 +40,7 @@ python -m desmume_mcp
 - Memory reads (`read_memory`, `dump_memory`, etc.) work across the full ARM9 address space — not just main RAM. VRAM (0x06000000), I/O registers (0x04000000), and cartridge-mapped regions are all accessible.
 - Audio capture: `desmume_audio_enable_capture()` switches to a capture sound core that accumulates PCM samples in a ring buffer. Uses DualSynchAsynch mode with per-frame `SPU_CloneUser()` to keep SPU_user in sync. Audio is s16le stereo at 44100Hz (~735 samples/frame).
 - Two viewing modes: `start_viewer` (SSE screenshot stream on port 8090, for debugging with frame history) and `start_video_stream` (HLS video+audio stream on port 8091, for watching gameplay). They are independent and can run simultaneously.
+- Settings are loaded from `settings.json` (user-local, gitignored) with `settings.default.json` (committed) as the fallback. The `auto_start` setting (`"none"`, `"viewer"`, or `"stream"`) controls whether a viewer/streamer is automatically launched on ROM load.
 
 ## Custom Scripts (Bridge Client)
 
