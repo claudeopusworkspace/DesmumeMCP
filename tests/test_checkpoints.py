@@ -174,6 +174,31 @@ class TestCheckpointManager:
         with pytest.raises(FileNotFoundError, match="Checkpoint file missing"):
             mgr.revert(holder, cp.id)
 
+    def test_promote_copies_file(self, mgr, mock_emu, tmp_path):
+        cp = mgr.create(mock_emu, 100, "press: a")
+        dest = str(tmp_path / "savestates" / "my_save.dst")
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+
+        result = mgr.promote(cp.id, dest)
+        assert result is cp
+        assert Path(dest).exists()
+        assert Path(dest).read_bytes() == Path(cp.path).read_bytes()
+        # Original checkpoint file still exists
+        assert Path(cp.path).exists()
+        # Checkpoint ring unchanged
+        assert mgr.total_count == 1
+        assert mgr.get(cp.id) is cp
+
+    def test_promote_missing_id_raises(self, mgr):
+        with pytest.raises(ValueError, match="Checkpoint not found"):
+            mgr.promote("bad_id_0", "/tmp/doesnt_matter.dst")
+
+    def test_promote_missing_file_raises(self, mgr, mock_emu, tmp_path):
+        cp = mgr.create(mock_emu, 100, "press: a")
+        Path(cp.path).unlink()
+        with pytest.raises(FileNotFoundError, match="Checkpoint file missing"):
+            mgr.promote(cp.id, str(tmp_path / "out.dst"))
+
     def test_clear(self, mgr, mock_emu):
         cp1 = mgr.create(mock_emu, 10, "press: a")
         cp2 = mgr.create(mock_emu, 20, "press: b")
@@ -299,6 +324,21 @@ class TestToolIntegration:
         assert result["discarded_checkpoints"] == 2
 
 
+    def test_promote_checkpoint(self, holder):
+        from desmume_mcp.server import _tool_press_buttons, _tool_promote_checkpoint
+
+        r1 = _tool_press_buttons(holder, ["a"], 1)
+        cp_id = r1["checkpoint_id"]
+
+        result = _tool_promote_checkpoint(holder, cp_id, "debug_save")
+        assert result["success"] is True
+        assert result["name"] == "debug_save"
+        assert result["source_checkpoint"]["id"] == cp_id
+        assert Path(result["path"]).exists()
+        # Checkpoint still exists in the ring
+        assert holder.checkpoints.get(cp_id) is not None
+
+
 class TestBridgeCheckpoints:
     """Test checkpoint methods exposed through the bridge server."""
 
@@ -346,6 +386,17 @@ class TestBridgeCheckpoints:
         assert result["reverted_to"]["id"] == r1["checkpoint_id"]
         assert result["remaining_checkpoints"] == 1
         assert result["discarded_checkpoints"] == 2
+
+    def test_save_checkpoint(self, holder):
+        from desmume_mcp.bridge import BridgeServer
+
+        bridge = BridgeServer(holder, "/tmp/test.sock")
+        r1 = bridge._create_checkpoint(action="step 1")
+
+        result = bridge._save_checkpoint(r1["checkpoint_id"], "saved_step_1")
+        assert result["name"] == "saved_step_1"
+        assert result["source_checkpoint"]["id"] == r1["checkpoint_id"]
+        assert Path(result["path"]).exists()
 
     def test_shared_history_with_mcp_tools(self, holder):
         """Bridge and MCP tool checkpoints share the same history."""

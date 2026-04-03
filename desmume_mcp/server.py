@@ -422,6 +422,23 @@ def _tool_revert_to_checkpoint(
     }
 
 
+def _tool_promote_checkpoint(
+    holder: EmulatorState, checkpoint_id: str, name: str
+) -> dict[str, Any]:
+    dest_path = str(holder.savestates_dir / f"{name}.dst")
+    cp = holder.checkpoints.promote(checkpoint_id, dest_path)
+    return {
+        "success": True,
+        "name": name,
+        "path": dest_path,
+        "source_checkpoint": {
+            "id": cp.id,
+            "frame": cp.frame,
+            "action": cp.action,
+        },
+    }
+
+
 def _tool_read_memory(
     holder: EmulatorState,
     address: int,
@@ -1284,6 +1301,20 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
             checkpoint_id: The 8-character hash ID of the checkpoint (from list_checkpoints).
         """
         return _tool_revert_to_checkpoint(holder, checkpoint_id)
+
+    @mcp.tool()
+    def save_checkpoint(checkpoint_id: str, name: str) -> dict[str, Any]:
+        """Save a checkpoint as a permanent named savestate without loading it.
+
+        Copies the checkpoint's savestate file to the savestates directory under the
+        given name. The current emulator state is not affected — use this to preserve
+        a checkpoint for later debugging without losing your current position.
+
+        Args:
+            checkpoint_id: The 8-character hash ID of the checkpoint (from list_checkpoints).
+            name: Name for the permanent savestate (e.g. "before_bug", "boss_fight").
+        """
+        return _tool_promote_checkpoint(holder, checkpoint_id, name)
 
     # ── Memory ──
 

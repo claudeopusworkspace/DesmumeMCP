@@ -63,6 +63,7 @@ class BridgeServer:
             "create_checkpoint": self._create_checkpoint,
             "list_checkpoints": self._list_checkpoints,
             "revert_to_checkpoint": self._revert_to_checkpoint,
+            "save_checkpoint": self._save_checkpoint,
         }
 
     # ── Method handlers ──
@@ -204,6 +205,19 @@ class BridgeServer:
             "total_frame": self._holder.frame_count,
             "remaining_checkpoints": self._holder.checkpoints.total_count,
             "discarded_checkpoints": discarded,
+        }
+
+    def _save_checkpoint(self, checkpoint_id: str, name: str) -> dict:
+        dest_path = str(self._holder.savestates_dir / f"{name}.dst")
+        cp = self._holder.checkpoints.promote(checkpoint_id, dest_path)
+        return {
+            "name": name,
+            "path": dest_path,
+            "source_checkpoint": {
+                "id": cp.id,
+                "frame": cp.frame,
+                "action": cp.action,
+            },
         }
 
     # ── Server lifecycle ──

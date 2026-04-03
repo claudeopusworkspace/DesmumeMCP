@@ -7,6 +7,7 @@ import hashlib
 import io
 import logging
 import os
+import shutil
 import threading
 import time
 from collections import deque
@@ -115,6 +116,21 @@ class CheckpointManager:
         self._ring.extend(items[: idx + 1])
 
         holder._notify_frame_change()
+        return cp
+
+    def promote(self, checkpoint_id: str, dest_path: str) -> Checkpoint:
+        """Copy a checkpoint's savestate to a permanent save state path.
+
+        Does not modify the checkpoint ring or the current emulator state.
+        """
+        cp = self.get(checkpoint_id)
+        if cp is None:
+            raise ValueError(f"Checkpoint not found: {checkpoint_id!r}")
+
+        if not Path(cp.path).exists():
+            raise FileNotFoundError(f"Checkpoint file missing: {cp.path}")
+
+        shutil.copy2(cp.path, dest_path)
         return cp
 
     def clear(self) -> int:

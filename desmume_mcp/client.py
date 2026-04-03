@@ -155,6 +155,10 @@ class EmulatorClient:
         """Revert to a checkpoint by hash ID, discarding all later checkpoints."""
         return self._call("revert_to_checkpoint", checkpoint_id=checkpoint_id)
 
+    def save_checkpoint(self, checkpoint_id: str, name: str) -> dict:
+        """Save a checkpoint as a permanent named savestate without loading it."""
+        return self._call("save_checkpoint", checkpoint_id=checkpoint_id, name=name)
+
     def get_screenshot(self, screen: str = "both", fmt: str = "png") -> tuple[str, bytes]:
         """Capture screenshot. Returns (mime_type, image_bytes)."""
         import base64
