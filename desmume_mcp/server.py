@@ -70,7 +70,10 @@ def _start_bridge(holder: EmulatorState) -> str | None:
         return holder._bridge._socket_path
     from .bridge import BridgeServer
 
-    sock_path = str(holder.data_dir / ".desmume_bridge.sock")
+    sock_path = os.environ.get(
+        "DESMUME_BRIDGE_SOCK",
+        str(holder.data_dir / ".desmume_bridge.sock"),
+    )
     bridge = BridgeServer(holder, sock_path)
     path = bridge.start()
     holder._bridge = bridge
