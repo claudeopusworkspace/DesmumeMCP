@@ -80,6 +80,45 @@ def _start_bridge(holder: EmulatorState) -> str | None:
     return path
 
 
+def _journal_write(holder: EmulatorState, method: str, **kwargs) -> None:
+    """Write a journal entry if the journal is active. Check renderer health."""
+    j = getattr(holder, "_journal", None)
+    if j is None:
+        return
+    # Check if renderer is still alive
+    proc = getattr(holder, "_renderer_proc", None)
+    if proc and proc.poll() is not None:
+        logger.warning("Renderer process exited (code=%d)", proc.returncode)
+        holder._renderer_proc = None
+        j.stop()
+        holder._journal = None
+        return
+    getattr(j, method)(**kwargs)
+
+
+def _journal_macro_steps(holder: EmulatorState, steps: list[dict]) -> None:
+    """Write journal entries for decomposed macro steps."""
+    for step in steps:
+        action = step["action"]
+        if action == "press":
+            _journal_write(holder, "write_frames", count=step.get("frames", 1),
+                           buttons=step["buttons"], touch_x=None, touch_y=None)
+            _journal_write(holder, "write_frames", count=1,
+                           buttons=None, touch_x=None, touch_y=None)
+        elif action == "hold":
+            _journal_write(holder, "write_frames", count=step.get("frames", 1),
+                           buttons=step.get("buttons"), touch_x=step.get("touch_x"),
+                           touch_y=step.get("touch_y"))
+        elif action == "wait":
+            _journal_write(holder, "write_frames", count=step.get("frames", 1),
+                           buttons=None, touch_x=None, touch_y=None)
+        elif action == "tap":
+            _journal_write(holder, "write_frames", count=step.get("frames", 1),
+                           buttons=None, touch_x=step["x"], touch_y=step["y"])
+            _journal_write(holder, "write_frames", count=1,
+                           buttons=None, touch_x=None, touch_y=None)
+
+
 def _tool_init_emulator(holder: EmulatorState) -> dict[str, Any]:
     logger.info("Tool: init_emulator")
     msg = holder.initialize()
@@ -94,10 +133,8 @@ def _tool_init_emulator(holder: EmulatorState) -> dict[str, Any]:
 def _tool_load_rom(holder: EmulatorState, rom_path: str) -> dict[str, Any]:
     logger.info("Tool: load_rom path=%s", rom_path)
 
-    # If the HLS streamer is running, clear its audio buffer before loading
-    # a new ROM to avoid leftover PCM data from the previous game.
-    if hasattr(holder, "_streamer") and holder._streamer is not None:
-        holder._streamer._audio_buf.clear()
+    # If the renderer is running, journal the ROM load so it reloads too
+    _journal_write(holder, "write_load_rom", rom_path=str(Path(rom_path).resolve()))
 
     msg = holder.load_rom(rom_path)
     result: dict[str, Any] = {"success": True, "rom_path": holder.rom_path, "message": msg}
@@ -146,26 +183,98 @@ def _tool_start_viewer(holder: EmulatorState, port: int = 8090) -> dict[str, Any
 
 
 def _tool_start_video_stream(holder: EmulatorState, port: int = 8091) -> dict[str, Any]:
-    from .streamer import HLSStreamer
+    import subprocess
+    import sys
+
+    from .journal import JournalWriter
 
     logger.info("Tool: start_video_stream port=%d", port)
-    if hasattr(holder, "_streamer") and holder._streamer is not None:
-        logger.debug("Streamer already running on port %d", holder._streamer.port)
+
+    # Check if renderer is already running
+    proc = getattr(holder, "_renderer_proc", None)
+    if proc is not None and proc.poll() is None:
+        logger.debug("Renderer already running (pid=%d)", proc.pid)
         return {
             "success": True,
-            "message": f"Video stream already running on port {holder._streamer.port}.",
-            "url": f"http://localhost:{holder._streamer.port}",
+            "message": f"Video stream already running (renderer pid={proc.pid}).",
+            "url": f"http://localhost:{port}",
         }
 
-    streamer = HLSStreamer(holder, port=port)
-    streamer.start()
-    holder._streamer = streamer
-    logger.info("HLS video stream started on port %d", port)
+    holder._require_rom()
+    journal_sock = str(holder.data_dir / ".desmume_journal.sock")
+
+    # Save current state so the renderer can start from the same point
+    initial_state = None
+    if holder.frame_count > 0:
+        initial_state = str(holder.data_dir / ".renderer_initial.dst")
+        holder.emu.savestate_save(initial_state)
+        logger.info("Saved initial state for renderer at frame %d", holder.frame_count)
+
+    # Start journal writer
+    journal = JournalWriter(journal_sock)
+    journal.start()
+    holder._journal = journal
+
+    # Launch renderer subprocess
+    cmd = [
+        sys.executable, "-m", "desmume_mcp.renderer",
+        "--journal-sock", journal_sock,
+        "--rom", holder.rom_path,
+        "--port", str(port),
+    ]
+    if initial_state:
+        cmd += ["--initial-state", initial_state]
+
+    renderer_proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    holder._renderer_proc = renderer_proc
+    logger.info(
+        "Renderer subprocess launched (pid=%d, port=%d)", renderer_proc.pid, port,
+    )
     return {
         "success": True,
-        "message": f"HLS video stream started on port {port}. Open in browser to watch gameplay with audio.",
+        "message": f"HLS video stream started on port {port} (renderer pid={renderer_proc.pid}).",
         "url": f"http://localhost:{port}",
     }
+
+
+def _tool_stop_video_stream(holder: EmulatorState) -> dict[str, Any]:
+    logger.info("Tool: stop_video_stream")
+    journal = getattr(holder, "_journal", None)
+    proc = getattr(holder, "_renderer_proc", None)
+
+    if journal is None and proc is None:
+        return {"success": True, "message": "No video stream running."}
+
+    # Send shutdown via journal, then stop the writer (which closes the
+    # socket — the renderer will see either the shutdown entry or a socket
+    # close, both of which cause it to exit its replay loop).
+    if journal:
+        try:
+            journal.write_shutdown()
+        except Exception:
+            logger.warning("Failed to send journal shutdown", exc_info=True)
+        journal.stop()
+
+    # Wait for renderer to exit gracefully
+    if proc and proc.poll() is None:
+        try:
+            proc.wait(timeout=8.0)
+            logger.info("Renderer exited (code=%d)", proc.returncode)
+        except subprocess.TimeoutExpired:
+            logger.warning("Renderer did not exit in 8s, terminating")
+            proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                logger.warning("Renderer did not terminate, killing")
+                proc.kill()
+                proc.wait(timeout=2.0)
+
+    holder._journal = None
+    holder._renderer_proc = None
+    return {"success": True, "message": "Video stream stopped."}
 
 
 def _tool_advance_frames(
@@ -180,6 +289,8 @@ def _tool_advance_frames(
     if count > MAX_ADVANCE_FRAMES:
         raise ValueError(f"count must be <= {MAX_ADVANCE_FRAMES}")
     advanced = holder.advance_frames(count, buttons or None, touch_x, touch_y)
+    _journal_write(holder, "write_frames", count=count,
+                   buttons=buttons or None, touch_x=touch_x, touch_y=touch_y)
     return {
         "frames_advanced": advanced,
         "total_frame": holder.frame_count,
@@ -200,6 +311,10 @@ def _tool_press_buttons(
         desc += f" ({frames}f)"
     cp = holder.checkpoints.create(emu, holder.frame_count, desc)
     holder.press_buttons(buttons, frames)
+    _journal_write(holder, "write_frames", count=frames, buttons=buttons,
+                   touch_x=None, touch_y=None)
+    _journal_write(holder, "write_frames", count=1, buttons=None,
+                   touch_x=None, touch_y=None)  # release frame
     return {
         "buttons": buttons,
         "held_frames": frames,
@@ -223,6 +338,10 @@ def _tool_tap_touch_screen(
         desc += f" ({frames}f)"
     cp = holder.checkpoints.create(emu, holder.frame_count, desc)
     holder.tap_touch_screen(x, y, frames)
+    _journal_write(holder, "write_frames", count=frames, buttons=None,
+                   touch_x=x, touch_y=y)
+    _journal_write(holder, "write_frames", count=1, buttons=None,
+                   touch_x=None, touch_y=None)  # release frame
     return {
         "x": x,
         "y": y,
@@ -360,6 +479,8 @@ def _tool_load_state(holder: EmulatorState, name: str) -> dict[str, Any]:
 
     success = result_box[0]
     logger.info("load_state completed in %.3fs (name=%s, success=%s)", elapsed, name, success)
+    if success:
+        _journal_write(holder, "write_load_state", path=path)
     holder._notify_frame_change()
     return {"success": success, "name": name, "total_frame": holder.frame_count}
 
@@ -381,6 +502,7 @@ def _tool_reset(holder: EmulatorState) -> dict[str, Any]:
     emu = holder._require_rom()
     emu.reset()
     holder.frame_count = 0
+    _journal_write(holder, "write_reset")
     holder._notify_frame_change()
     return {"success": True, "message": "NDS reset.", "total_frame": 0}
 
@@ -411,6 +533,7 @@ def _tool_revert_to_checkpoint(
 ) -> dict[str, Any]:
     before_count = holder.checkpoints.total_count
     cp = holder.checkpoints.revert(holder, checkpoint_id)
+    _journal_write(holder, "write_load_state", path=cp.path)
     discarded = before_count - holder.checkpoints.total_count
     return {
         "success": True,
@@ -800,6 +923,7 @@ def _tool_run_macro(
     total_frames = 0
     for _ in range(repeat):
         total_frames += holder.run_macro_steps(steps)
+        _journal_macro_steps(holder, steps)
 
     return {
         "name": name,
@@ -1128,6 +1252,8 @@ def _tool_delete_watch(holder: EmulatorState, name: str) -> dict[str, Any]:
 def create_server(data_dir: Path | None = None) -> FastMCP:
     """Create the DeSmuME MCP server."""
     holder = EmulatorState(data_dir=data_dir or Path.cwd())
+    holder._journal = None
+    holder._renderer_proc = None
 
     mcp = FastMCP(name="DeSmuME MCP")
 
@@ -1160,10 +1286,14 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
     def start_video_stream(port: int = 8091) -> dict[str, Any]:
         """Start an HLS video stream of the DS gameplay with audio.
 
-        Launches ffmpeg to encode raw frames and audio into an HLS stream
-        served on the given port. Navigate to http://localhost:<port> to
-        watch gameplay in real-time with audio. Every emulated frame is
-        captured and encoded; the browser buffers and plays back at 60fps.
+        Launches a separate rendering emulator process that replays inputs
+        at real-time 60fps and encodes them into an HLS stream served on
+        the given port. Navigate to http://localhost:<port> to watch
+        gameplay with audio.
+
+        The renderer runs independently — the main emulator processes
+        commands at full speed while the renderer plays them back for
+        the stream.
 
         This is separate from the screenshot viewer (start_viewer) which
         is designed for debugging with frame-by-frame history browsing.
@@ -1172,6 +1302,11 @@ def create_server(data_dir: Path | None = None) -> FastMCP:
             port: HTTP port to listen on (default 8091).
         """
         return _tool_start_video_stream(holder, port)
+
+    @mcp.tool()
+    def stop_video_stream() -> dict[str, Any]:
+        """Stop the HLS video stream and shut down the rendering process."""
+        return _tool_stop_video_stream(holder)
 
     @mcp.tool()
     def advance_frames(

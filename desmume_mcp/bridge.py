@@ -66,24 +66,51 @@ class BridgeServer:
             "save_checkpoint": self._save_checkpoint,
         }
 
+    # ── Journal helper ──
+
+    def _journal_write(self, method: str, **kwargs) -> None:
+        """Write a journal entry if the journal is active."""
+        j = getattr(self._holder, "_journal", None)
+        if j is None:
+            return
+        proc = getattr(self._holder, "_renderer_proc", None)
+        if proc and proc.poll() is not None:
+            self._holder._renderer_proc = None
+            j.stop()
+            self._holder._journal = None
+            return
+        getattr(j, method)(**kwargs)
+
     # ── Method handlers ──
 
     def _advance_frames(self, count: int = 1, buttons: list[str] | None = None,
                         touch_x: int | None = None, touch_y: int | None = None) -> dict:
         advanced = self._holder.advance_frames(count, buttons, touch_x, touch_y)
+        self._journal_write("write_frames", count=count, buttons=buttons,
+                            touch_x=touch_x, touch_y=touch_y)
         return {"frames_advanced": advanced, "total_frame": self._holder.frame_count}
 
     def _advance_frame(self, buttons: list[str] | None = None,
                        touch_x: int | None = None, touch_y: int | None = None) -> dict:
         self._holder.advance_frame(buttons, touch_x, touch_y)
+        self._journal_write("write_frames", count=1, buttons=buttons,
+                            touch_x=touch_x, touch_y=touch_y)
         return {"total_frame": self._holder.frame_count}
 
     def _press_buttons(self, buttons: list[str], frames: int = 1) -> dict:
         self._holder.press_buttons(buttons, frames)
+        self._journal_write("write_frames", count=frames, buttons=buttons,
+                            touch_x=None, touch_y=None)
+        self._journal_write("write_frames", count=1, buttons=None,
+                            touch_x=None, touch_y=None)  # release
         return {"total_frame": self._holder.frame_count}
 
     def _tap_touch_screen(self, x: int, y: int, frames: int = 1) -> dict:
         self._holder.tap_touch_screen(x, y, frames)
+        self._journal_write("write_frames", count=frames, buttons=None,
+                            touch_x=x, touch_y=y)
+        self._journal_write("write_frames", count=1, buttons=None,
+                            touch_x=None, touch_y=None)  # release
         return {"total_frame": self._holder.frame_count}
 
     def _get_screenshot(self, screen: str = "both", fmt: str = "png") -> dict:
@@ -148,6 +175,8 @@ class BridgeServer:
         emu = self._holder._require_rom()
         emu.cycle()
         self._holder.frame_count += 1
+        self._journal_write("write_frames", count=1, buttons=None,
+                            touch_x=None, touch_y=None)
         return {"total_frame": self._holder.frame_count}
 
     def _save_state(self, path: str) -> dict:
@@ -159,6 +188,8 @@ class BridgeServer:
     def _load_state(self, path: str) -> dict:
         emu = self._holder._require_rom()
         success = emu.savestate_load(path)
+        if success:
+            self._journal_write("write_load_state", path=path)
         logger.info("load_state path=%s success=%s", path, success)
         return {"success": success, "path": path}
 
@@ -199,6 +230,7 @@ class BridgeServer:
     def _revert_to_checkpoint(self, checkpoint_id: str) -> dict:
         before_count = self._holder.checkpoints.total_count
         cp = self._holder.checkpoints.revert(self._holder, checkpoint_id)
+        self._journal_write("write_load_state", path=cp.path)
         discarded = before_count - self._holder.checkpoints.total_count
         return {
             "reverted_to": {"id": cp.id, "frame": cp.frame, "action": cp.action},

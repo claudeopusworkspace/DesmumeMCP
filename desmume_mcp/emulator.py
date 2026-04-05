@@ -301,8 +301,15 @@ class EmulatorState:
         buttons: list[str] | None = None,
         touch_x: int | None = None,
         touch_y: int | None = None,
+        _skip_gpu: bool = False,
     ) -> None:
-        """Set input and advance one frame."""
+        """Set input and advance one frame.
+
+        Args:
+            _skip_gpu: If True, skip GPU rendering for this frame. Used by
+                batch methods to skip intermediate frames when no per-cycle
+                callbacks need the rendered output.
+        """
         emu = self._require_rom()
 
         # Set keypad
@@ -315,6 +322,8 @@ class EmulatorState:
         else:
             emu.input_release_touch()
 
+        if _skip_gpu:
+            emu.skip_next_frame()
         emu.cycle(with_joystick=False)
         self.frame_count += 1
         self._notify_cycle()
@@ -328,8 +337,12 @@ class EmulatorState:
     ) -> int:
         """Advance multiple frames holding the same input. Returns frames advanced."""
         t0 = time.monotonic()
-        for _ in range(count):
-            self.advance_frame(buttons, touch_x, touch_y)
+        # Skip GPU rendering on intermediate frames when no per-cycle
+        # callbacks need the rendered output (e.g. HLS streamer not attached).
+        can_skip = not self._cycle_callbacks
+        for i in range(count):
+            skip = can_skip and (i < count - 1)
+            self.advance_frame(buttons, touch_x, touch_y, _skip_gpu=skip)
         elapsed = time.monotonic() - t0
         self._notify_frame_change()
         if count > 1:
@@ -346,18 +359,22 @@ class EmulatorState:
 
     def press_buttons(self, buttons: list[str], frames: int = 1) -> None:
         """Press buttons for N frames, then release for 1 frame."""
+        can_skip = not self._cycle_callbacks
         # Hold
-        for _ in range(frames):
-            self.advance_frame(buttons)
-        # Release
+        for i in range(frames):
+            skip = can_skip and (i < frames - 1)
+            self.advance_frame(buttons, _skip_gpu=skip)
+        # Release — always render the final frame
         self.advance_frame()
         self._notify_frame_change()
 
     def tap_touch_screen(self, x: int, y: int, frames: int = 1) -> None:
         """Tap the touchscreen for N frames, then release for 1 frame."""
-        for _ in range(frames):
-            self.advance_frame(touch_x=x, touch_y=y)
-        # Release
+        can_skip = not self._cycle_callbacks
+        for i in range(frames):
+            skip = can_skip and (i < frames - 1)
+            self.advance_frame(touch_x=x, touch_y=y, _skip_gpu=skip)
+        # Release — always render the final frame
         self.advance_frame()
         self._notify_frame_change()
 
